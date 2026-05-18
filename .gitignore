@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+chroma_knee/
+rag_audit.jsonl
+diretrizes_pdf/
+*.db

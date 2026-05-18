@@ -1,0 +1,24 @@
+# Core LangChain
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-groq>=0.2.0
+
+# Vector store
+chromadb>=0.5.0
+
+# Embeddings + reranker
+sentence-transformers>=3.0.0
+torch>=2.0.0
+
+# Fontes de conhecimento
+biopython>=1.83
+scholarly>=1.7.11
+pymupdf>=1.24.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+requests>=2.31.0
+
+# Web / servidor
+flask>=3.0.0
+python-dotenv>=1.0.0
+gunicorn>=21.0.0
