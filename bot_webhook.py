@@ -4,9 +4,12 @@ Endpoint: /webhook/messages-upsert
 """
 
 import os
+import time
 import hashlib
 import logging
+import threading
 import requests
+from collections import OrderedDict
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -17,6 +20,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot_webhook")
 
 app = Flask(__name__)
+
+# ── Deduplicação de mensagens ──────────────────────────────────────────────────
+_seen_ids: OrderedDict = OrderedDict()
+_seen_lock = threading.Lock()
+MAX_SEEN = 2000          # cache máximo de IDs
+MAX_AGE_SECONDS = 60     # ignora mensagens com mais de 60s (histórico/sync)
+
+
+def _is_duplicate(msg_id: str) -> bool:
+    """Retorna True se o msg_id já foi processado recentemente."""
+    with _seen_lock:
+        if msg_id in _seen_ids:
+            return True
+        _seen_ids[msg_id] = True
+        while len(_seen_ids) > MAX_SEEN:
+            _seen_ids.popitem(last=False)
+        return False
 
 # Inicializa chain 1x no startup (carrega modelos ~30s)
 log.info("Inicializando KneeRAGChain...")
@@ -65,8 +85,25 @@ def messages_upsert():
         if key.get("fromMe"):
             return jsonify({"status": "ignored_self"}), 200
 
+        # Deduplicação por ID único da mensagem
+        msg_id = key.get("id", "")
+        if msg_id and _is_duplicate(msg_id):
+            log.debug("Duplicata ignorada: %s", msg_id)
+            return jsonify({"status": "duplicate"}), 200
+
+        # Ignora mensagens antigas (histórico / sync do WhatsApp)
+        msg_ts = msg_data.get("messageTimestamp", 0)
+        if msg_ts and (time.time() - int(msg_ts)) > MAX_AGE_SECONDS:
+            log.info("Mensagem antiga ignorada (ts=%s)", msg_ts)
+            return jsonify({"status": "old_message"}), 200
+
+        # Ignora mensagens de grupos
+        remote_jid = key.get("remoteJid", "")
+        if "@g.us" in remote_jid:
+            return jsonify({"status": "ignored_group"}), 200
+
         # Extrai texto e remetente
-        phone = key.get("remoteJid", "").replace("@s.whatsapp.net", "")
+        phone = remote_jid.replace("@s.whatsapp.net", "")
         message_obj = msg_data.get("message", {})
         text = (
             message_obj.get("conversation")
@@ -89,7 +126,7 @@ def messages_upsert():
         # Se red flag, também notifica handoff
         if result["red_flag"]:
             handoff_msg = (
-                f"🚨 RED FLAG detectada\n"
+                "🚨 RED FLAG detectada\n"
                 f"De: {phone}\n"
                 f"Msg: {text[:200]}\n"
                 f"Hash: {phone_hash[:12]}"
@@ -130,7 +167,6 @@ def admin_ingest():
     token = request.headers.get("X-Admin-Token", "")
     if token != os.getenv("GROQ_API_KEY", ""):
         return jsonify({"status": "unauthorized"}), 403
-    import threading
     from knee_loader import KneeKnowledgeLoader
     def run_ingest():
         try:
