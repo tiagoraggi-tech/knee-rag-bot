@@ -124,6 +124,32 @@ def debug():
     })
 
 
+@app.route("/admin/ingest", methods=["POST"])
+def admin_ingest():
+    """Dispara ingestão KneeLoader em background. Protegido por GROQ_API_KEY como token."""
+    token = request.headers.get("X-Admin-Token", "")
+    if token != os.getenv("GROQ_API_KEY", ""):
+        return jsonify({"status": "unauthorized"}), 403
+    import threading
+    from knee_loader import KneeKnowledgeLoader
+    def run_ingest():
+        try:
+            log.info("=== INGESTÃO INICIADA ===")
+            loader = KneeKnowledgeLoader(
+                persist_dir=os.getenv("CHROMA_DIR", "/data/chroma_knee"),
+                entrez_email=os.getenv("ENTREZ_EMAIL", "tiagoraggi@gmail.com"),
+            )
+            loader.ingest_pubmed(max_results=30)
+            loader.ingest_websites()
+            loader.build_vectorstore()
+            log.info("=== INGESTÃO CONCLUÍDA ===")
+        except Exception as e:
+            log.exception("Erro na ingestão: %s", e)
+    t = threading.Thread(target=run_ingest, daemon=True)
+    t.start()
+    return jsonify({"status": "ingest_started", "message": "Verifique os logs do Railway"}), 202
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
