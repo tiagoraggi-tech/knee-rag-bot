@@ -16,11 +16,11 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.schema.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from sentence_transformers import CrossEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
