@@ -4,9 +4,9 @@ knee_retrieval_chain.py — Retrieval chain com guardrails CFM 2.314/2022 + LGPD
 Plug direto no Chroma criado por knee_loader.py.
 
 Arquitetura:
-  Query → Retrieval (Chroma, k=20) → Reranker (cross-encoder) → Top-5
-        → Prompt com guardrails → Groq llama-3.3-70b → Resposta + citações
-        → Pós-processamento (disclaimer, auditoria)
+  Query → Retrieval (Chroma, k=20) → Reranker (cross-encoder) → Top-3
+        → Prompt com guardrails → Groq (fallback: llama-3.3-70b → llama-3.1-8b → gemma2-9b)
+        → Resposta + citações → Pós-processamento (disclaimer, auditoria)
 """
 
 import os
@@ -25,6 +25,15 @@ from sentence_transformers import CrossEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("knee_chain")
+
+
+# ===== MODELOS FALLBACK =====
+
+GROQ_FALLBACK_MODELS = [
+    "llama-3.3-70b-versatile",   # primario: 100k TPD
+    "llama-3.1-8b-instant",      # fallback: quota separada (~500k TPD)
+    "gemma2-9b-it",              # ultimo recurso
+]
 
 
 # ===== PROMPTS =====
@@ -122,7 +131,7 @@ class KneeRAGChain:
         embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
         retrieval_k: int = 20,
-        rerank_top_k: int = 5,
+        rerank_top_k: int = 3,
         temperature: float = 0.2,
         audit_log_path: Optional[str] = "./rag_audit.jsonl",
     ):
@@ -149,14 +158,39 @@ class KneeRAGChain:
         if not api_key:
             raise ValueError("GROQ_API_KEY não fornecida.")
 
-        self.llm = ChatGroq(
-            api_key=api_key,
-            model=groq_model,
-            temperature=temperature,
-            max_tokens=1024,
+        models_to_try = [groq_model] + [m for m in GROQ_FALLBACK_MODELS if m != groq_model]
+        self.llms: List[ChatGroq] = []
+        for model_name in models_to_try:
+            self.llms.append(ChatGroq(
+                api_key=api_key,
+                model=model_name,
+                temperature=temperature,
+                max_tokens=1024,
+            ))
+
+        log.info(
+            "KneeRAGChain ready | modelos=%d, k=%d→%d",
+            len(self.llms), retrieval_k, rerank_top_k,
         )
 
-        log.info("KneeRAGChain ready | model=%s, k=%d→%d", groq_model, retrieval_k, rerank_top_k)
+    def _invoke_with_fallback(self, messages: list) -> Optional[str]:
+        """Tenta cada modelo em ordem; fallback automatico em rate limit (429)."""
+        last_error = None
+        for llm in self.llms:
+            name = getattr(llm, "model_name", str(llm))
+            try:
+                response = llm.invoke(messages)
+                log.info("Modelo usado: %s", name)
+                return response.content
+            except Exception as e:
+                s = str(e)
+                if "429" in s or "rate_limit" in s.lower() or "Rate limit" in s:
+                    log.warning("Rate limit em %s, tentando proximo...", name)
+                else:
+                    log.error("Erro em %s: %s", name, e)
+                last_error = e
+        log.error("Todos os modelos falharam: %s", last_error)
+        return None
 
     def retrieve(self, query: str, scope_filter: Optional[str] = None) -> List[Tuple[Document, float]]:
         filter_dict = None
@@ -169,7 +203,7 @@ class KneeRAGChain:
         if not candidates:
             return []
 
-        pairs = [(query, doc.page_content[:1000]) for doc, _ in candidates]
+        pairs = [(query, doc.page_content[:600]) for doc, _ in candidates]
         rerank_scores = self.reranker.predict(pairs, show_progress_bar=False)
 
         reranked = [(doc, float(score)) for (doc, _), score in zip(candidates, rerank_scores)]
@@ -192,7 +226,7 @@ class KneeRAGChain:
             if source_type:
                 header += f" — {source_type}"
 
-            context_blocks.append(f"{header}\n{doc.page_content}\n")
+            context_blocks.append(f"{header}\n{eoc.page_content}\n")
             sources.append({
                 "index": i, "title": title, "url": url,
                 "source_type": source_type, "rerank_score": round(score, 3),
@@ -245,14 +279,11 @@ class KneeRAGChain:
 
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=USER_TEMPLATE.format(context=context, question=question)),
+            HumanMessage(content=USERE_TEMPLATE_format(context=context, question=question)),
         ]
 
-        try:
-            response = self.llm.invoke(messages)
-            answer = response.content
-        except Exception as e:
-            log.error("LLM failure: %s", e)
+        answer = self._invoke_with_fallback(messages)
+        if answer is None:
             answer = (
                 "Tive um problema técnico ao gerar a resposta. "
                 "Por favor, tente novamente em instantes ou entre em contato com o consultório."
