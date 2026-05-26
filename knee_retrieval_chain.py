@@ -226,7 +226,7 @@ class KneeRAGChain:
             if source_type:
                 header += f" — {source_type}"
 
-            context_blocks.append(f"{header}\n{eoc.page_content}\n")
+            context_blocks.append(f"{header}\n{doc.page_content}\n")
             sources.append({
                 "index": i, "title": title, "url": url,
                 "source_type": source_type, "rerank_score": round(score, 3),
