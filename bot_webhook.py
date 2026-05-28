@@ -48,7 +48,7 @@ chain = KneeRAGChain(
 log.info("Chain pronta.")
 
 EVOLUTION_URL = os.getenv("EVOLUTION_API_URL")
-EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "knee-bot")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "uriel-bot")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
 HANDOFF_NUMBER = os.getenv("HANDOFF_NUMBER", "5524988370406")
 
@@ -72,6 +72,7 @@ def send_whatsapp(phone: str, message: str) -> bool:
 
 
 @app.route("/webhook/messages-upsert", methods=["POST"])
+@app.route("/webhook/messages-upsert/MESSAGES_UPSERT", methods=["POST"])
 def messages_upsert():
     try:
         data = request.get_json(force=True)
