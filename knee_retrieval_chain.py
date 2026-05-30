@@ -1,12 +1,12 @@
 """
-knee_retrieval_chain.py — Retrieval chain com guardrails CFM 2.314/2022 + LGPD
+knee_retrieval_chain.py â Retrieval chain com guardrails CFM 2.314/2022 + LGPD
 
 Plug direto no Chroma criado por knee_loader.py.
 
 Arquitetura:
-  Query → Retrieval (Chroma, k=20) → Reranker (cross-encoder) → Top-3
-        → Prompt com guardrails → Groq (fallback: llama-3.3-70b → llama-3.1-8b → gemma2-9b)
-        → Resposta + citações → Pós-processamento (disclaimer, auditoria)
+  Query â Retrieval (Chroma, k=20) â Reranker (cross-encoder) â Top-3
+        â Prompt com guardrails â Groq (fallback: llama-3.3-70b â llama-3.1-8b â gemma2-9b)
+        â Resposta + citaÃ§Ãµes â PÃ³s-processamento (disclaimer, auditoria)
 """
 
 import os
@@ -38,45 +38,45 @@ GROQ_FALLBACK_MODELS = [
 
 # ===== PROMPTS =====
 
-SYSTEM_PROMPT = """Você é um assistente de educação em saúde do consultório do Dr. Tiago Raggi (ortopedista, CRM Brasil). Sua função é fornecer informações educativas sobre saúde do joelho a pacientes via WhatsApp.
+SYSTEM_PROMPT = """VocÃª Ã© um assistente de educaÃ§Ã£o em saÃºde do consultÃ³rio do Dr. Tiago Raggi (ortopedista, CRM Brasil). Sua funÃ§Ã£o Ã© fornecer informaÃ§Ãµes educativas sobre saÃºde do joelho a pacientes via WhatsApp.
 
-## REGRAS OBRIGATÓRIAS — CFM Resolução 2.314/2022
+## REGRAS OBRIGATÃRIAS â CFM ResoluÃ§Ã£o 2.314/2022
 
-1. **NUNCA emita diagnóstico definitivo.** Você pode descrever condições e sintomas em termos educativos, mas sempre indicando que apenas avaliação presencial com médico permite diagnóstico.
+1. **NUNCA emita diagnÃ³stico definitivo.** VocÃª pode descrever condiÃ§Ãµes e sintomas em termos educativos, mas sempre indicando que apenas avaliaÃ§Ã£o presencial com mÃ©dico permite diagnÃ³stico.
 
-2. **NUNCA prescreva medicamentos, doses ou condutas terapêuticas individualizadas.** Pode mencionar classes terapêuticas comumente usadas (ex: "anti-inflamatórios são frequentemente prescritos") sem indicar marca, dose ou posologia específica.
+2. **NUNCA prescreva medicamentos, doses ou condutas terapÃªuticas individualizadas.** Pode mencionar classes terapÃªuticas comumente usadas (ex: "anti-inflamatÃ³rios sÃ£o frequentemente prescritos") sem indicar marca, dose ou posologia especÃ­fica.
 
-3. **NUNCA substitua consulta presencial.** Toda resposta deve reforçar que dúvidas clínicas devem ser tratadas em consulta com o Dr. Tiago ou outro médico.
+3. **NUNCA substitua consulta presencial.** Toda resposta deve reforÃ§ar que dÃºvidas clÃ­nicas devem ser tratadas em consulta com o Dr. Tiago ou outro mÃ©dico.
 
-4. **Em sinais de gravidade** (dor intensa, edema súbito, incapacidade de apoiar peso, febre, deformidade, sinais neurológicos), oriente busca por pronto-atendimento IMEDIATAMENTE.
+4. **Em sinais de gravidade** (dor intensa, edema sÃºbito, incapacidade de apoiar peso, febre, deformidade, sinais neurolÃ³gicos), oriente busca por pronto-atendimento IMEDIATAMENTE.
 
-5. **Não solicite nem armazene dados pessoais sensíveis** (CPF, exames, prontuário). Se o paciente compartilhar, oriente que esses dados devem ser apresentados em consulta.
+5. **NÃ£o solicite nem armazene dados pessoais sensÃ­veis** (CPF, exames, prontuÃ¡rio). Se o paciente compartilhar, oriente que esses dados devem ser apresentados em consulta.
 
-## REGRAS DE CONTEÚDO
+## REGRAS DE CONTEÃDO
 
-6. **Use APENAS o CONTEXTO fornecido abaixo.** Se a informação não estiver no contexto, diga "Essa informação específica não está na minha base — recomendo conversar com o Dr. Tiago em consulta."
+6. **Use APENAS o CONTEXTO fornecido abaixo.** Se a informaÃ§Ã£o nÃ£o estiver no contexto, diga "Essa informaÃ§Ã£o especÃ­fica nÃ£o estÃ¡ na minha base â recomendo conversar com o Dr. Tiago em consulta."
 
 7. **CITE as fontes** ao final da resposta, no formato:
    ```
-   📚 Fontes:
-   • [Título curto] — [URL]
+   ð Fontes:
+   â¢ [TÃ­tulo curto] â [URL]
    ```
 
-8. **Linguagem acessível** ao paciente leigo: explique termos técnicos (ex: "gonartrose, que é o desgaste da cartilagem do joelho").
+8. **Linguagem acessÃ­vel** ao paciente leigo: explique termos tÃ©cnicos (ex: "gonartrose, que Ã© o desgaste da cartilagem do joelho").
 
-9. **Português brasileiro**, tom acolhedor e profissional. Sem emojis excessivos (no máximo 1-2 quando agregar clareza).
+9. **PortuguÃªs brasileiro**, tom acolhedor e profissional. Sem emojis excessivos (no mÃ¡ximo 1-2 quando agregar clareza).
 
-10. **Resposta curta** adequada ao WhatsApp: idealmente 3-6 parágrafos curtos. Use listas quando facilitar.
+10. **Resposta curta** adequada ao WhatsApp: idealmente 3-6 parÃ¡grafos curtos. Use listas quando facilitar.
 
 ## FORMATO DE RESPOSTA
 
 [Resposta educativa baseada no CONTEXTO]
 
-⚠️ *Esta informação é educativa e não substitui consulta médica. Para avaliação do seu caso específico, agende com o Dr. Tiago.*
+â ï¸ *Esta informaÃ§Ã£o Ã© educativa e nÃ£o substitui consulta mÃ©dica. Para avaliaÃ§Ã£o do seu caso especÃ­fico, agende com o Dr. Tiago.*
 
-📚 Fontes:
-• [fonte 1] — [url]
-• [fonte 2] — [url]
+ð Fontes:
+â¢ [fonte 1] â [url]
+â¢ [fonte 2] â [url]
 """
 
 USER_TEMPLATE = """## CONTEXTO RECUPERADO
@@ -93,26 +93,26 @@ Responda seguindo TODAS as regras do system prompt."""
 # ===== RED FLAGS =====
 
 RED_FLAG_PATTERNS = [
-    r"\b(n[ãa]o consigo (andar|apoiar|levantar))\b",
-    r"\b(dor (insuport[áa]vel|intensa|muito forte))\b",
+    r"\b(n[Ã£a]o consigo (andar|apoiar|levantar))\b",
+    r"\b(dor (insuport[Ã¡a]vel|intensa|muito forte))\b",
     r"\b(joelho (deformado|torto|deslocado))\b",
     r"\b(estourou|estalou (muito |forte))\b",
     r"\b(inchou (muito |de repente|subitamente))\b",
     r"\b(febre|calafrio).{0,30}(joelho|articula)",
-    r"\b(formigamento|dorm[êe]ncia|perdi (a )?sensibilidade)\b",
-    r"\b(perna roxa|p[ée] roxo|cianose)\b",
-    r"\b(acidente|trauma|queda).{0,40}(agora|hoje|h[áa] pouco)",
+    r"\b(formigamento|dorm[Ãªe]ncia|perdi (a )?sensibilidade)\b",
+    r"\b(perna roxa|p[Ã©e] roxo|cianose)\b",
+    r"\b(acidente|trauma|queda).{0,40}(agora|hoje|h[Ã¡a] pouco)",
 ]
 
-EMERGENCY_RESPONSE = """⚠️ **Os sintomas que você descreveu podem indicar uma situação que precisa de avaliação médica URGENTE.**
+EMERGENCY_RESPONSE = """â ï¸ **Os sintomas que vocÃª descreveu podem indicar uma situaÃ§Ã£o que precisa de avaliaÃ§Ã£o mÃ©dica URGENTE.**
 
 Por favor, procure atendimento agora:
-• **Pronto-socorro ortopédico** mais próximo, ou
-• **SAMU 192** se houver dificuldade de locomoção
+â¢ **Pronto-socorro ortopÃ©dico** mais prÃ³ximo, ou
+â¢ **SAMU 192** se houver dificuldade de locomoÃ§Ã£o
 
-Não espere para agendar consulta de rotina. Após o atendimento de urgência, entre em contato para acompanhamento com o Dr. Tiago.
+NÃ£o espere para agendar consulta de rotina. ApÃ³s o atendimento de urgÃªncia, entre em contato para acompanhamento com o Dr. Tiago.
 
-⚠️ *Esta orientação é automática e baseada nos sintomas descritos. Em qualquer dúvida sobre a gravidade, sempre opte por buscar atendimento.*"""
+â ï¸ *Esta orientaÃ§Ã£o Ã© automÃ¡tica e baseada nos sintomas descritos. Em qualquer dÃºvida sobre a gravidade, sempre opte por buscar atendimento.*"""
 
 
 def has_red_flags(text: str) -> bool:
@@ -156,7 +156,7 @@ class KneeRAGChain:
 
         api_key = groq_api_key or os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GROQ_API_KEY não fornecida.")
+            raise ValueError("GROQ_API_KEY nÃ£o fornecida.")
 
         models_to_try = [groq_model] + [m for m in GROQ_FALLBACK_MODELS if m != groq_model]
         self.llms: List[ChatGroq] = []
@@ -169,7 +169,7 @@ class KneeRAGChain:
             ))
 
         log.info(
-            "KneeRAGChain ready | modelos=%d, k=%d→%d",
+            "KneeRAGChain ready | modelos=%d, k=%dâ%d",
             len(self.llms), retrieval_k, rerank_top_k,
         )
 
@@ -215,7 +215,7 @@ class KneeRAGChain:
         sources = []
         for i, (doc, score) in enumerate(results, 1):
             md = doc.metadata
-            title = md.get("title", "Sem título")[:150]
+            title = md.get("title", "Sem tÃ­tulo")[:150]
             url = md.get("url", "")
             source_type = md.get("source", "")
             year = md.get("year", "")
@@ -224,7 +224,7 @@ class KneeRAGChain:
             if year:
                 header += f" ({year})"
             if source_type:
-                header += f" — {source_type}"
+                header += f" â {source_type}"
 
             context_blocks.append(f"{header}\n{doc.page_content}\n")
             sources.append({
@@ -264,9 +264,9 @@ class KneeRAGChain:
         results = self.retrieve(question, scope_filter=scope_filter)
         if not results:
             answer = (
-                "Essa informação específica não está na minha base de conhecimento. "
-                "Recomendo conversar com o Dr. Tiago em consulta para uma orientação adequada ao seu caso.\n\n"
-                "⚠️ *Esta resposta é educativa e não substitui consulta médica.*"
+                "Essa informaÃ§Ã£o especÃ­fica nÃ£o estÃ¡ na minha base de conhecimento. "
+                "Recomendo conversar com o Dr. Tiago em consulta para uma orientaÃ§Ã£o adequada ao seu caso.\n\n"
+                "â ï¸ *Esta resposta Ã© educativa e nÃ£o substitui consulta mÃ©dica.*"
             )
             self._audit({
                 "ts": timestamp, "patient_hash": patient_id_hash,
@@ -279,18 +279,18 @@ class KneeRAGChain:
 
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=USERE_TEMPLATE_format(context=context, question=question)),
+            HumanMessage(content=USER_TEMPLATE.format(context=context, question=question)),
         ]
 
         answer = self._invoke_with_fallback(messages)
         if answer is None:
             answer = (
-                "Tive um problema técnico ao gerar a resposta. "
-                "Por favor, tente novamente em instantes ou entre em contato com o consultório."
+                "Tive um problema tÃ©cnico ao gerar a resposta. "
+                "Por favor, tente novamente em instantes ou entre em contato com o consultÃ³rio."
             )
 
-        if "não substitui consulta" not in answer.lower() and "consulta médica" not in answer.lower():
-            answer += "\n\n⚠️ *Esta informação é educativa e não substitui consulta médica.*"
+        if "nÃ£o substitui consulta" not in answer.lower() and "consulta mÃ©dica" not in answer.lower():
+            answer += "\n\nâ ï¸ *Esta informaÃ§Ã£o Ã© educativa e nÃ£o substitui consulta mÃ©dica.*"
 
         self._audit({
             "ts": timestamp, "patient_hash": patient_id_hash,
@@ -308,11 +308,11 @@ class KneeRAGChain:
 
 def format_for_whatsapp(result: Dict[str, Any]) -> str:
     answer = result["answer"]
-    if result["sources"] and "📚 Fontes" not in answer and "fontes" not in answer.lower():
-        sources_block = "\n\n📚 Fontes:\n"
+    if result["sources"] and "ð Fontes" not in answer and "fontes" not in answer.lower():
+        sources_block = "\n\nð Fontes:\n"
         for s in result["sources"][:3]:
             if s.get("url"):
-                sources_block += f"• {s['title'][:80]} — {s['url']}\n"
+                sources_block += f"â¢ {s['title'][:80]} â {s['url']}\n"
         answer += sources_block
     return answer
 
@@ -332,7 +332,7 @@ if __name__ == "__main__":
     print("CASO 1: Pergunta educativa")
     print("=" * 60)
     r1 = chain.ask(
-        "O que é artrose de joelho e quais os tratamentos sem cirurgia?",
+        "O que Ã© artrose de joelho e quais os tratamentos sem cirurgia?",
         scope_filter="conservative",
         patient_id_hash=hashlib.md5(b"+5524999999999").hexdigest(),
     )
@@ -341,11 +341,11 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("CASO 2: Red flag")
     print("=" * 60)
-    r2 = chain.ask("Doutor, caí da escada agora, meu joelho está deformado e não consigo apoiar")
+    r2 = chain.ask("Doutor, caÃ­ da escada agora, meu joelho estÃ¡ deformado e nÃ£o consigo apoiar")
     print(format_for_whatsapp(r2))
 
     print("\n" + "=" * 60)
-    print("CASO 3: Cirúrgico")
+    print("CASO 3: CirÃºrgico")
     print("=" * 60)
-    r3 = chain.ask("Como é a recuperação após reconstrução de LCA?", scope_filter="surgical")
+    r3 = chain.ask("Como Ã© a recuperaÃ§Ã£o apÃ³s reconstruÃ§Ã£o de LCA?", scope_filter="surgical")
     print(format_for_whatsapp(r3))
