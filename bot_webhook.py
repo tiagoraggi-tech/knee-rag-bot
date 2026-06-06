@@ -1,44 +1,163 @@
 """
-bot_webhook.py — Webhook Flask para integração Evolution API + KneeRAGChain
-Endpoint: /webhook/messages-upsert
+bot_webhook.py — Webhook Flask para integracao Evolution API + KneeRAGChain
 """
-
-import os
-import time
-import hashlib
-import logging
-import threading
-import requests
+import os, time, hashlib, logging, threading, requests
 from collections import OrderedDict
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-
 from knee_retrieval_chain import KneeRAGChain, format_for_whatsapp
+from knee_protocols import (
+    save_protocol, list_protocols, assign_protocol,
+    get_patient_protocols, format_protocols_as_context,
+    list_patient_assignments, get_patient_detail, remove_patient_protocol,
+    list_admin_help, get_protocol_by_number, get_protocol_by_index,
+    delete_protocol_by_index,
+)
+from knee_prescriptions import (
+    parse_prescription, add_prescription,
+    get_due_prescriptions, advance_next_dose, deactivate_expired,
+    cancel_prescription, cancel_patient_prescriptions,
+    format_active_prescriptions, build_reminder_message,
+)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot_webhook")
-
 app = Flask(__name__)
 
-# ── Deduplicação de mensagens ──────────────────────────────────────────────────
 _seen_ids: OrderedDict = OrderedDict()
 _seen_lock = threading.Lock()
-MAX_SEEN = 2000          # cache máximo de IDs
-MAX_AGE_SECONDS = 60     # ignora mensagens com mais de 60s (histórico/sync)
+_admin_sessions: dict = {}
+_admin_sessions_lock = threading.Lock()
+ADMIN_SESSION_TTL = 600
+_protocol_sessions: dict = {}
 
+_STUDY_SYSTEM = (
+    "Voce e um assistente clinico de suporte ao Dr. Tiago Raggi, ortopedista." + chr(10) +
+    "Seu interlocutor e o proprio medico, nao um paciente. Portanto:" + chr(10) +
+    "- Forneca dados clinicos completos: doses, posologia, protocolos cirurgicos, escalas, niveis de evidencia." + chr(10) +
+    "- Cite artigos, guidelines e fontes da base de conhecimento disponivel." + chr(10) +
+    "- Seja preciso e tecnico; use nomenclatura medica sem simplificacao." + chr(10) +
+    "- Responda de forma conversacional — o Dr. Tiago esta estudando ou planejando conduta." + chr(10) +
+    "- Apresente controversias, comparacoes entre tecnicas e limitacoes dos estudos quando relevante." + chr(10) +
+    "- Nao adicione disclaimers de procure um medico — voce esta falando com o medico." + chr(10) +
+    "- Se a base nao tiver informacao suficiente, diga claramente." + chr(10) +
+    "- Portugues brasileiro, tom tecnico e collegial."
+)
+
+_STUDY_TEMPLATE = (
+    "## LITERATURA RECUPERADA" + chr(10) + chr(10) +
+    "{context}" + chr(10) + chr(10) +
+    "## PERGUNTA / SOLICITACAO" + chr(10) + chr(10) +
+    "{question}" + chr(10) + chr(10) +
+    "Responda com profundidade clinica, citando as fontes recuperadas."
+)
+
+def _groq_study_turn(history: list, question: str, context: str) -> str:
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    hdrs = {"Authorization": f"Bearer {os.getenv('GROQ_API_KEY','')}", "Content-Type": "application/json"}
+    msgs = [{"role": "system", "content": _STUDY_SYSTEM}]
+    msgs.extend(history)
+    msgs.append({"role": "user", "content": _STUDY_TEMPLATE.format(
+        context=context or "Nenhum resultado relevante encontrado.", question=question)})
+    payload = {"model": "llama-3.3-70b-versatile", "messages": msgs, "max_tokens": 1500, "temperature": 0.3}
+    try:
+        r = requests.post(url, headers=hdrs, json=payload, timeout=45)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error("Groq study error: %s", e)
+        return "❌ Erro na consulta a IA. Tente novamente."
+
+def _groq_query_protocol(title: str, content: str, question: str) -> str:
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    hdrs = {"Authorization": f"Bearer {os.getenv('GROQ_API_KEY','')}", "Content-Type": "application/json"}
+    sys_msg = "Voce e um assistente medico especializado. Responda a pergunta do Dr. Tiago com base no protocolo clinico fornecido."
+    usr_msg = f"Protocolo: *{title}*" + chr(10) + chr(10) + content + chr(10) + chr(10) + f"Pergunta: {question}"
+    payload = {"model": "llama-3.3-70b-versatile", "messages": [
+        {"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}],
+        "max_tokens": 800, "temperature": 0.3}
+    try:
+        r = requests.post(url, headers=hdrs, json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error("Groq query error: %s", e)
+        return "❌ Erro ao consultar IA. Tente novamente."
+
+def _get_or_create_admin_session(phone: str) -> dict:
+    with _admin_sessions_lock:
+        sess = _admin_sessions.get(phone)
+        if sess and (time.time() - sess["ts"]) > ADMIN_SESSION_TTL:
+            del _admin_sessions[phone]; sess = None
+        if not sess:
+            _admin_sessions[phone] = {"history": [], "ts": time.time()}
+        return _admin_sessions[phone]
+
+def _reset_admin_session(phone: str):
+    with _admin_sessions_lock:
+        _admin_sessions.pop(phone, None)
+
+def handle_admin_patient_session(phone: str, text: str) -> str | None:
+    import re as _re3, json as _json3, requests as _req3
+    PATIENT_KW = ["paciente","ver_paciente","ver_pacientes","remov","desvincul","vinculado","quem tem","listar pacient"]
+    CREATION_KW = ["cadastr","cri","novo protocolo","adicionar protocolo","instrucao"]
+    if any(k in text.lower() for k in CREATION_KW): return None
+    sess = _get_or_create_admin_session(phone)
+    if not sess["history"] and not any(k in text.lower() for k in PATIENT_KW): return None
+    from knee_protocols import list_patient_assignments as _lpa, get_patient_detail as _gpd, remove_patient_protocol as _rpp, list_protocols as _lp
+    sys_prompt = (
+        "Voce e o assistente de gestao de pacientes do Dr. Tiago Raggi." + chr(10) +
+        "Interprete o que ele quer fazer e execute ou peca esclarecimento." + chr(10) + chr(10) +
+        f"DADOS ATUAIS:{chr(10)}{_lpa()}{chr(10)}{chr(10)}{_lp()}{chr(10)}{chr(10)}" +
+        "REGRAS:" + chr(10) +
+        "- Responda SOMENTE com JSON valido, sem texto fora do JSON" + chr(10) +
+        '- Formato: {"action":"reply"|"get_patient"|"remove_protocol","patient_n":<int ou null>,"protocol":"<titulo ou null>","message":"<resposta pt-BR>"}' + chr(10) +
+        "- reply: apenas responde/pergunta (sem executar)" + chr(10) +
+        "- get_patient: mostra protocolos do paciente N (patient_n obrigatorio)" + chr(10) +
+        "- remove_protocol: remove protocolo do paciente (patient_n + protocol obrigatorios)" + chr(10) +
+        "- Antes de remover SEMPRE peca confirmacao com reply" + chr(10) +
+        "- NUNCA finja cadastrar protocolos — use /instrucao Titulo: conteudo"
+    )
+    history = sess["history"] + [{"role": "user", "content": text}]
+    msgs_llm = [{"role": "system", "content": sys_prompt}] + history
+    try:
+        resp = _req3.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}", "Content-Type": "application/json"},
+            json={"model": "llama-3.1-8b-instant", "messages": msgs_llm, "max_tokens": 300, "temperature": 0},
+            timeout=10)
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        m = _re3.search(r'{.*}', raw, _re3.DOTALL)
+        parsed = _json3.loads(m.group()) if m else None
+    except Exception as e:
+        log.warning("Admin patient LLM error: %s", e); _reset_admin_session(phone); return None
+    if not parsed: _reset_admin_session(phone); return None
+    action = parsed.get("action", "reply")
+    patient_n = parsed.get("patient_n")
+    protocol = parsed.get("protocol")
+    message = parsed.get("message", "")
+    if action == "get_patient" and patient_n:
+        reply = _gpd(int(patient_n)); _reset_admin_session(phone)
+    elif action == "remove_protocol" and patient_n and protocol:
+        reply = _rpp(int(patient_n), str(protocol)); _reset_admin_session(phone)
+    else:
+        reply = message
+        sess["history"].append({"role": "user", "content": text})
+        sess["history"].append({"role": "assistant", "content": raw})
+        sess["ts"] = time.time()
+        if len(sess["history"]) > 10: sess["history"] = sess["history"][-10:]
+    return reply or message
+
+MAX_SEEN = 2000
+MAX_AGE_SECONDS = 60
 
 def _is_duplicate(msg_id: str) -> bool:
-    """Retorna True se o msg_id já foi processado recentemente."""
     with _seen_lock:
-        if msg_id in _seen_ids:
-            return True
+        if msg_id in _seen_ids: return True
         _seen_ids[msg_id] = True
-        while len(_seen_ids) > MAX_SEEN:
-            _seen_ids.popitem(last=False)
+        while len(_seen_ids) > MAX_SEEN: _seen_ids.popitem(last=False)
         return False
 
-# Inicializa chain 1x no startup (carrega modelos ~30s)
 log.info("Inicializando KneeRAGChain...")
 chain = KneeRAGChain(
     persist_dir=os.getenv("CHROMA_DIR", "/data/chroma_knee"),
@@ -51,15 +170,11 @@ EVOLUTION_URL = os.getenv("EVOLUTION_API_URL")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "uriel-bot")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
 HANDOFF_NUMBER = os.getenv("HANDOFF_NUMBER", "5524988370406")
-
+ADMIN_PHONE = os.getenv("ADMIN_PHONE", "5521999249903")
 
 def send_whatsapp(phone: str, message: str) -> bool:
-    """Envia mensagem via Evolution API."""
     url = f"{EVOLUTION_URL}/message/sendText/{EVOLUTION_INSTANCE}"
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": EVOLUTION_API_KEY,
-    }
+    headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
     payload = {"number": phone, "text": message}
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -67,111 +182,310 @@ def send_whatsapp(phone: str, message: str) -> bool:
         log.info("Enviado para %s", phone[-4:])
         return True
     except Exception as e:
-        log.error("Falha ao enviar: %s", e)
-        return False
-
+        log.error("Falha ao enviar: %s", e); return False
 
 @app.route("/webhook/messages-upsert", methods=["POST"])
 @app.route("/webhook/messages-upsert/MESSAGES_UPSERT", methods=["POST"])
 def messages_upsert():
     try:
         data = request.get_json(force=True)
-        log.debug("Payload recebido: %s", str(data)[:300])
-
-        # Estrutura padrão da Evolution API
         msg_data = data.get("data", {})
         key = msg_data.get("key", {})
-
-        # Ignora mensagens do próprio bot
-        if key.get("fromMe"):
-            return jsonify({"status": "ignored_self"}), 200
-
-        # Deduplicação por ID único da mensagem
+        if key.get("fromMe"): return jsonify({"status": "ignored_self"}), 200
         msg_id = key.get("id", "")
-        if msg_id and _is_duplicate(msg_id):
-            log.debug("Duplicata ignorada: %s", msg_id)
-            return jsonify({"status": "duplicate"}), 200
-
-        # Ignora mensagens antigas (histórico / sync do WhatsApp)
+        if msg_id and _is_duplicate(msg_id): return jsonify({"status": "duplicate"}), 200
         msg_ts = msg_data.get("messageTimestamp", 0)
-        if msg_ts and (time.time() - int(msg_ts)) > MAX_AGE_SECONDS:
-            log.info("Mensagem antiga ignorada (ts=%s)", msg_ts)
-            return jsonify({"status": "old_message"}), 200
-
-        # Ignora mensagens de grupos
+        if msg_ts and (time.time() - int(msg_ts)) > MAX_AGE_SECONDS: return jsonify({"status": "old_message"}), 200
         remote_jid = key.get("remoteJid", "")
-        if "@g.us" in remote_jid:
-            return jsonify({"status": "ignored_group"}), 200
-
-        # Extrai texto e remetente
+        if "@g.us" in remote_jid: return jsonify({"status": "ignored_group"}), 200
         phone = remote_jid.replace("@s.whatsapp.net", "")
         message_obj = msg_data.get("message", {})
-        text = (
-            message_obj.get("conversation")
-            or message_obj.get("extendedTextMessage", {}).get("text")
-            or ""
-        ).strip()
-
-        if not text or not phone:
-            return jsonify({"status": "no_text"}), 200
-
+        text = (message_obj.get("conversation") or message_obj.get("extendedTextMessage", {}).get("text") or "").strip()
+        if not text or not phone: return jsonify({"status": "no_text"}), 200
         log.info("Mensagem de %s: %s", phone[-4:], text[:80])
+        is_admin = phone.lstrip("+") == ADMIN_PHONE.lstrip("+")
+        text_lower = text.lower().strip()
 
-        # Hash anônimo para auditoria (LGPD)
+        if is_admin:
+            import re as _re_admin
+
+            # /estudo — ativa sessao de estudo clinico
+            if text_lower == "/estudo":
+                _protocol_sessions[phone] = {"mode": "study", "history": []}
+                reply = (
+                    "🩺 *Modo estudo ativado.*" + chr(10) + chr(10) +
+                    "Faca suas perguntas clinicas — vou buscar na literatura do joelho" + chr(10) +
+                    "e responder com profundidade tecnica, sem restricoes de paciente." + chr(10) + chr(10) +
+                    "A sessao mantem o contexto da conversa." + chr(10) +
+                    "Digite */sair* para encerrar."
+                )
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "study_mode_started"}), 200
+
+            # /sair — encerra sessao de estudo ou edicao
+            if text_lower == "/sair":
+                if phone in _protocol_sessions:
+                    mode = _protocol_sessions.pop(phone).get("mode", "")
+                    reply = f"✅ Sessao *{mode}* encerrada."
+                else:
+                    reply = "Nenhuma sessao de estudo/edicao ativa."
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "session_closed"}), 200
+
+            # Turno dentro da sessao de estudo
+            psess = _protocol_sessions.get(phone)
+            if psess and psess.get("mode") == "study":
+                send_whatsapp(phone, "🔍 Buscando na literatura…")
+                try:
+                    results = chain.retrieve(text)
+                    context_str, sources = chain._format_context(results) if results else ("", [])
+                except Exception as e:
+                    log.error("Retrieval error no /estudo: %s", e); context_str, sources = "", []
+                answer = _groq_study_turn(psess["history"], text, context_str)
+                if sources and "📚" not in answer:
+                    fontes = chr(10) + chr(10) + "📚 *Fontes recuperadas:*" + chr(10)
+                    for s in sources[:4]:
+                        if s.get("url"): fontes += f"• {s['title'][:80]} — {s['url']}" + chr(10)
+                    answer += fontes
+                psess["history"].append({"role": "user", "content": text})
+                psess["history"].append({"role": "assistant", "content": answer})
+                if len(psess["history"]) > 20: psess["history"] = psess["history"][-20:]
+                send_whatsapp(phone, answer)
+                return jsonify({"status": "study_turn"}), 200
+
+            # Modo edicao: aguardando novo conteudo
+            if psess and psess.get("mode") == "editing":
+                new_content = text.strip()
+                if new_content.lower() == "/cancelar":
+                    del _protocol_sessions[phone]
+                    send_whatsapp(phone, "✏️ Edicao cancelada.")
+                    return jsonify({"status": "edit_cancelled"}), 200
+                reply = save_protocol(psess["title"], new_content)
+                del _protocol_sessions[phone]
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_edited"}), 200
+
+            # /N: phone — vincula protocolo #N ao paciente
+            _assign_m = _re_admin.match(r'^/(\d+):\s*(\d+)', text.strip())
+            if _assign_m:
+                _n = int(_assign_m.group(1)); _pnum = _assign_m.group(2).strip()
+                _ptitle = get_protocol_by_number(_n)
+                log.info("ASSIGN protocolo #%d ao paciente %s", _n, _pnum[-4:])
+                reply = assign_protocol(_pnum, _ptitle, phone) if _ptitle else f"❌ Protocolo #{_n} nao encontrado."
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_assigned"}), 200
+
+            # /instrucao Titulo: conteudo
+            if text_lower.startswith("/instrucao "):
+                body = text[len("/instrucao "):].strip()
+                if ":" in body:
+                    title, cont = body.split(":", 1)
+                    reply = save_protocol(title.strip(), cont.strip())
+                else:
+                    reply = "❌ Formato: /instrucao Titulo: conteudo"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_saved"}), 200
+
+            # ver comandos
+            if text_lower in ("/ver_comandos", "ver comandos"):
+                send_whatsapp(phone, list_admin_help())
+                return jsonify({"status": "commands_listed"}), 200
+
+            # /ver N — conteudo completo do protocolo #N
+            if text_lower.startswith("/ver "):
+                raw = text[5:].strip()
+                if raw.isdigit():
+                    proto = get_protocol_by_index(int(raw))
+                    reply = (f"📄 *{proto[0]}*" + chr(10) + chr(10) + proto[1]) if proto else f"❌ Protocolo #{raw} nao encontrado."
+                else:
+                    reply = "❌ Use: /ver N  (ex: /ver 2)"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_viewed"}), 200
+
+            # /editar N — inicia edicao de protocolo
+            if text_lower.startswith("/editar "):
+                raw = text[8:].strip()
+                if raw.isdigit():
+                    proto = get_protocol_by_index(int(raw))
+                    if proto:
+                        _protocol_sessions[phone] = {"mode": "editing", "index": int(raw), "title": proto[0]}
+                        reply = (f"✏️ *Editando: {proto[0]}*" + chr(10) + chr(10) +
+                                 f"Conteudo atual:" + chr(10) + proto[1] + chr(10) + chr(10) +
+                                 "Envie o *novo conteudo completo* na proxima mensagem, ou */cancelar* para abortar.")
+                    else:
+                        reply = f"❌ Protocolo #{raw} nao encontrado."
+                else:
+                    reply = "❌ Use: /editar N  (ex: /editar 2)"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "edit_mode_started"}), 200
+
+            # /apagar N — remove protocolo por indice
+            if text_lower.startswith("/apagar "):
+                raw = text[8:].strip()
+                reply = delete_protocol_by_index(int(raw)) if raw.isdigit() else "❌ Use: /apagar N  (ex: /apagar 2)"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_deleted"}), 200
+
+            # /consultar N: pergunta
+            if text_lower.startswith("/consultar "):
+                body = text[11:].strip()
+                if ":" in body:
+                    idx_str, question = body.split(":", 1)
+                    if idx_str.strip().isdigit():
+                        proto = get_protocol_by_index(int(idx_str.strip()))
+                        if proto:
+                            send_whatsapp(phone, f"🔍 Consultando protocolo *{proto[0]}*…")
+                            reply = _groq_query_protocol(proto[0], proto[1], question.strip())
+                        else:
+                            reply = f"❌ Protocolo #{idx_str.strip()} nao encontrado."
+                    else:
+                        reply = "❌ Use: /consultar N: sua pergunta"
+                else:
+                    reply = "❌ Use: /consultar N: pergunta  (ex: /consultar 2: resumir em 3 pontos)"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_consulted"}), 200
+
+            # /ver_pacientes
+            if text_lower == "/ver_pacientes":
+                send_whatsapp(phone, list_patient_assignments())
+                return jsonify({"status": "patients_listed"}), 200
+
+            # /ver_paciente N
+            if text_lower.startswith("/ver_paciente "):
+                arg = text[len("/ver_paciente "):].strip()
+                try:
+                    reply = get_patient_detail(int(arg))
+                except ValueError:
+                    reply = "❌ Use /ver_paciente N onde N e o numero do paciente em /ver_pacientes"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "patient_detail"}), 200
+
+            # /remover_protocolo N: Titulo
+            if text_lower.startswith("/remover_protocolo "):
+                body = text[len("/remover_protocolo "):].strip()
+                if ":" in body:
+                    n_str, titulo = body.split(":", 1)
+                    try:
+                        reply = remove_patient_protocol(int(n_str.strip()), titulo.strip())
+                    except ValueError:
+                        reply = "❌ Use /remover_protocolo N: Titulo"
+                else:
+                    reply = "❌ Use /remover_protocolo N: Titulo"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "protocol_removed"}), 200
+
+            # /receita: telefone medicamento ... de X/Xh [em caso de Y] [por Z dias]
+            if text_lower.startswith("/receita:"):
+                body = text[len("/receita:"):].strip()
+                parsed = parse_prescription(body)
+                if not parsed:
+                    reply = ("❌ Formato:\n"
+                             "/receita: 55249XXXXXXX tramadol 50mg 1 comp VO de 8/8h em caso de dor por 5 dias\n"
+                             "/receita: 55249XXXXXXX pregabalina 75mg 1 comp VO às 21h por 30 dias")
+                else:
+                    pid = add_prescription(
+                        patient_phone=parsed["patient_phone"],
+                        med_text=parsed["med_text"],
+                        condition_text=parsed["condition_text"],
+                        interval_hours=parsed["interval_hours"],
+                        specific_hour=parsed["specific_hour"],
+                        duration_days=parsed["duration_days"],
+                    )
+                    cond_str = f" {parsed['condition_text']}" if parsed["condition_text"] else ""
+                    if parsed["specific_hour"] is not None:
+                        sched_str = f"às {parsed['specific_hour']:02d}h diariamente"
+                    else:
+                        h = parsed["interval_hours"]
+                        sched_str = (f"de {int(h)}/{int(h)}h" if h and h == int(h)
+                                     else f"a cada {h}h" if h else "horário não detectado")
+                    reply = (f"✅ Prescrição #{pid} criada\n"
+                             f"📱 Paciente: *...{parsed['patient_phone'][-4:]}*\n"
+                             f"💊 {parsed['med_text']}{cond_str}\n"
+                             f"⏱ {sched_str} por {parsed['duration_days']} dias")
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "prescription_created"}), 200
+
+            # /receitas — lista prescrições ativas
+            if text_lower in ("/receitas", "/ver_receitas"):
+                send_whatsapp(phone, format_active_prescriptions())
+                return jsonify({"status": "prescriptions_listed"}), 200
+
+            # /cancelar_receita: ID ou telefone
+            if text_lower.startswith("/cancelar_receita:"):
+                arg = text[len("/cancelar_receita:"):].strip()
+                if arg.isdigit():
+                    ok = cancel_prescription(int(arg))
+                    reply = f"✅ Prescrição #{arg} cancelada." if ok else f"❌ Prescrição #{arg} não encontrada."
+                elif len(arg) >= 10:
+                    count = cancel_patient_prescriptions(arg)
+                    reply = (f"✅ {count} prescrição(ões) cancelada(s) para *...{arg[-4:]}*."
+                             if count else f"❌ Nenhuma prescrição ativa para *...{arg[-4:]}*.")
+                else:
+                    reply = "❌ Use: /cancelar_receita: ID  ou  /cancelar_receita: 55249XXXXXXX"
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "prescription_cancelled"}), 200
+
+            # Gestao de pacientes via LLM (linguagem natural sem /)
+            if not text_lower.startswith("/"):
+                _patient_reply = handle_admin_patient_session(phone, text)
+                if _patient_reply is not None:
+                    send_whatsapp(phone, _patient_reply)
+                    return jsonify({"status": "admin_patient_session"}), 200
+
+            # LLM natural language protocol assignment
+            try:
+                import re as _re2, json as _json2, requests as _req2
+                _protos_raw = list_protocols()
+                _llm_msg = f'Admin enviou: "{text}"\nProtocolos: {_protos_raw}\nSe pede vincular protocolo a paciente, responda JSON: {{"protocolo":"titulo","telefone":"numeros"}}. Caso contrario: null'
+                _gr = _req2.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}", "Content-Type": "application/json"},
+                    json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": _llm_msg}], "max_tokens": 80, "temperature": 0},
+                    timeout=8)
+                _lt = _gr.json()["choices"][0]["message"]["content"].strip()
+                if _lt and _lt != "null":
+                    _pd = _json2.loads(_lt)
+                    if _pd and _pd.get("protocolo") and _pd.get("telefone"):
+                        reply = assign_protocol(_pd["telefone"], _pd["protocolo"], phone)
+                        send_whatsapp(phone, reply)
+                        return jsonify({"status": "protocol_assigned_llm"}), 200
+            except Exception as _e:
+                log.warning("LLM admin parse: %s", _e)
+
+        # Resposta ao paciente
         phone_hash = hashlib.md5(phone.encode()).hexdigest()
-
-        # Processa
-        result = chain.ask(text, patient_id_hash=phone_hash)
+        patient_protos = get_patient_protocols(phone)
+        protocol_context = format_protocols_as_context(patient_protos) if patient_protos else ""
+        result = chain.ask(text, patient_id_hash=phone_hash, protocol_context=protocol_context)
         reply = format_for_whatsapp(result)
-
-        # Se red flag, também notifica handoff
         if result["red_flag"]:
-            handoff_msg = (
-                "🚨 RED FLAG detectada\n"
-                f"De: {phone}\n"
-                f"Msg: {text[:200]}\n"
-                f"Hash: {phone_hash[:12]}"
-            )
+            handoff_msg = "🚨 RED FLAG detectada" + chr(10) + f"De: {phone}" + chr(10) + f"Msg: {text[:200]}" + chr(10) + f"Hash: {phone_hash[:12]}"
             send_whatsapp(HANDOFF_NUMBER, handoff_msg)
-
-        # Envia resposta ao paciente
         send_whatsapp(phone, reply)
-
         return jsonify({"status": "ok", "red_flag": result["red_flag"]}), 200
 
     except Exception as e:
         log.exception("Erro no webhook: %s", e)
         return jsonify({"status": "error", "detail": str(e)}), 500
 
-
 @app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
+def health(): return jsonify({"status": "ok"}), 200
 
 @app.route("/debug", methods=["GET"])
 def debug():
     chroma_dir = os.getenv("CHROMA_DIR", "/data/chroma_knee")
     import os as _os
-    return jsonify({
-        "chroma_dir": chroma_dir,
-        "chroma_exists": _os.path.exists(chroma_dir),
+    return jsonify({"chroma_dir": chroma_dir, "chroma_exists": _os.path.exists(chroma_dir),
         "audit_log": os.getenv("AUDIT_LOG", "/data/rag_audit.jsonl"),
-        "evolution_url": EVOLUTION_URL,
-        "instance": EVOLUTION_INSTANCE,
-    })
-
+        "evolution_url": EVOLUTION_URL, "instance": EVOLUTION_INSTANCE})
 
 @app.route("/admin/ingest", methods=["POST"])
 def admin_ingest():
-    """Dispara ingestão KneeLoader em background. Protegido por GROQ_API_KEY como token."""
     token = request.headers.get("X-Admin-Token", "")
-    if token != os.getenv("GROQ_API_KEY", ""):
-        return jsonify({"status": "unauthorized"}), 403
+    if token != os.getenv("GROQ_API_KEY", ""): return jsonify({"status": "unauthorized"}), 403
     from knee_loader import KneeKnowledgeLoader
     def run_ingest():
         try:
-            log.info("=== INGESTÃO INICIADA ===")
+            log.info("=== INGESTAO INICIADA ===")
             loader = KneeKnowledgeLoader(
                 persist_dir=os.getenv("CHROMA_DIR", "/data/chroma_knee"),
                 entrez_email=os.getenv("ENTREZ_EMAIL", "tiagoraggi@gmail.com"),
@@ -179,13 +493,32 @@ def admin_ingest():
             loader.ingest_pubmed(max_results=30)
             loader.ingest_websites()
             loader.build_vectorstore()
-            log.info("=== INGESTÃO CONCLUÍDA ===")
-        except Exception as e:
-            log.exception("Erro na ingestão: %s", e)
-    t = threading.Thread(target=run_ingest, daemon=True)
-    t.start()
+            log.info("=== INGESTAO CONCLUIDA ===")
+        except Exception as e: log.exception("Erro na ingestao: %s", e)
+    threading.Thread(target=run_ingest, daemon=True).start()
     return jsonify({"status": "ingest_started", "message": "Verifique os logs do Railway"}), 202
 
+def _prescription_reminder_worker():
+    """Thread de fundo: envia lembretes de medicação a cada 5 minutos."""
+    import time as _time
+    while True:
+        try:
+            deactivate_expired()
+            for row in get_due_prescriptions():
+                msg = build_reminder_message(row["med_text"], row["condition_text"])
+                if send_whatsapp(row["patient_phone"], msg):
+                    advance_next_dose(row["id"], row["interval_hours"], row["specific_hour"])
+                    log.info("Lembrete enviado para *%s: %s",
+                             row["patient_phone"][-4:], row["med_text"][:30])
+        except Exception as e:
+            log.warning("prescription_reminder_worker: %s", e)
+        _time.sleep(300)  # 5 minutos
+
+threading.Thread(
+    target=_prescription_reminder_worker,
+    daemon=True,
+    name="prescription-reminders"
+).start()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))

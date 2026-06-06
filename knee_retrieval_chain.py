@@ -213,6 +213,7 @@ class KneeRAGChain:
         question: str,
         scope_filter: Optional[str] = None,
         patient_id_hash: Optional[str] = None,
+        protocol_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         timestamp = datetime.utcnow().isoformat()
 
@@ -228,7 +229,9 @@ class KneeRAGChain:
             }
 
         results = self.retrieve(question, scope_filter=scope_filter)
-        if not results:
+
+        # Se há protocolo vinculado, usa mesmo sem resultados do RAG
+        if not results and not protocol_context:
             answer = (
                 "Essa informação específica não está na minha base de conhecimento. "
                 "Recomendo conversar com o Dr. Tiago em consulta para uma orientação adequada ao seu caso.\n\n"
@@ -241,11 +244,17 @@ class KneeRAGChain:
             })
             return {"answer": answer, "sources": [], "red_flag": False, "retrieved_count": 0}
 
-        context, sources = self._format_context(results)
+        context, sources = self._format_context(results) if results else ("", [])
+
+        # Protocolos clínicos têm prioridade máxima — vêm antes do contexto RAG
+        if protocol_context:
+            full_context = protocol_context + ("\n\n" + context if context else "")
+        else:
+            full_context = context
 
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=USER_TEMPLATE.format(context=context, question=question)),
+            HumanMessage(content=USER_TEMPLATE.format(context=full_context, question=question)),
         ]
 
         try:
