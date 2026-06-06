@@ -116,7 +116,7 @@ def parse_prescription(text):
     #    NAO aceita "8h" sozinho (isso eh intervalo)
     specific_hour = None
     hour_match = re.search(
-        r'\bas\s+(\d{1,2})(?:\s*(?:h(?:oras?)?|:\d{2}))?\b'  # as X / as Xh / as X horas
+        r'\b[aà]s\s+(\d{1,2})(?:\s*(?:h(?:oras?)?|:\d{2}))?\b'  # as X / as Xh / as X horas
         r'|(?<!\d)(\d{1,2}):\d{2}\b',                         # 21:00
         rest, re.IGNORECASE
     )
