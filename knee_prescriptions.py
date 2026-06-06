@@ -1,14 +1,5 @@
 """
 knee_prescriptions.py -- Gerenciamento de prescricoes e lembretes de medicacao via WhatsApp.
-
-Comando: /receita: 55249XXXXXXX tramadol 50mg 1 comp VO de 8/8h em caso de dor por 5 dias
-         /receita: 55249XXXXXXX pregabalina 75mg 1 comp VO as 21h por 30 dias
-
-Regras:
-- Lembretes somente entre 06:00 e 00:00
-- Horario especifico ("as Xh") tem prioridade sobre intervalo
-- Duracao padrao: 7 dias se nao informada
-- "em caso de X" entra na mensagem do lembrete quando presente
 """
 
 import os, re, logging, sqlite3
@@ -18,9 +9,8 @@ log = logging.getLogger("knee_prescriptions")
 
 DB_PATH = os.getenv("PRESCRIPTIONS_DB", "/data/prescriptions.db")
 
-HOUR_MIN = 6    # 06:00
-HOUR_MAX = 24   # 00:00 (meia-noite)
-
+HOUR_MIN = 6
+HOUR_MAX = 24
 
 # ----------------------------------------------------------------- banco
 
@@ -49,24 +39,44 @@ def init_db():
             created_at      TEXT    NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prescription_templates (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            text            TEXT    NOT NULL,
+            med_text        TEXT    NOT NULL,
+            condition_text  TEXT    DEFAULT '',
+            interval_hours  REAL    DEFAULT NULL,
+            specific_hour   INTEGER DEFAULT NULL,
+            duration_days   INTEGER DEFAULT 7,
+            created_at      TEXT    NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+# ----------------------------------------------------------------- helpers
+
+def format_schedule(specific_hour, interval_hours):
+    """Formata horario/intervalo para exibicao."""
+    if specific_hour is not None:
+        return f"as {specific_hour:02d}h"
+    h = interval_hours
+    if h and h == int(h):
+        return f"de {int(h)}/{int(h)}h"
+    elif h:
+        return f"a cada {h}h"
+    return "horario nao definido"
 
 
 # ----------------------------------------------------------------- parsing
 
 def _next_dose_in_window(base_dt, interval_hours, specific_hour):
-    """
-    Calcula a primeira dose a partir de base_dt que cai dentro da janela 06h-00h.
-    - specific_hour: dose diaria nessa hora exata
-    - interval_hours: proxima dose = base_dt + interval, deslocada se fora da janela
-    """
     if specific_hour is not None:
         candidate = base_dt.replace(hour=specific_hour, minute=0, second=0, microsecond=0)
         if candidate <= base_dt:
             candidate += timedelta(days=1)
         return candidate
-
     candidate = base_dt
     for _ in range(48):
         if HOUR_MIN <= candidate.hour < HOUR_MAX:
@@ -81,15 +91,10 @@ def parse_prescription(text):
     """
     Extrai campos de uma prescricao a partir do texto apos '/receita:'.
     Retorna dict ou None se invalido.
-
-    Exemplos:
-      "55249XXXXXXX tramadol 50mg 1 comp VO de 8/8h em caso de dor por 5 dias"
-      "55249XXXXXXX pregabalina 75mg 1 comp VO as 21h por 30 dias"
-      "55249XXXXXXX dipirona 500mg 1 comp VO de 6/6h"
     """
     t = text.strip()
 
-    # 1. Extrai telefone (primeiro token numerico >= 10 digitos)
+    # 1. Telefone
     phone_match = re.match(r'^(\d{10,15})\s+', t)
     if not phone_match:
         return None
@@ -105,19 +110,17 @@ def parse_prescription(text):
 
     # 3. Condicao ("em caso de ...")
     condition_text = ""
-    cond_match = re.search(r'\bem\s+caso\s+de\s+(.+?)(?=\bpor\b|\bde\s+\d|\bas\b|$)',
+    cond_match = re.search(r'\bem\s+caso\s+de\s+(.+?)(?=\bpor\b|\bde\s+\d|\b[aà]s\b|$)',
                            rest, re.IGNORECASE)
     if cond_match:
         condition_text = "em caso de " + cond_match.group(1).strip().rstrip(",. ")
         rest = (rest[:cond_match.start()] + rest[cond_match.end():]).strip()
 
-    # 4. Horario especifico -- SOMENTE quando "as/as" esta presente ou formato HH:MM
-    #    Aceita: "as 21h", "as 21 horas", "as 21", "21:00"
-    #    NAO aceita "8h" sozinho (isso eh intervalo)
+    # 4. Horario especifico (somente quando "as/às" presente ou HH:MM)
     specific_hour = None
     hour_match = re.search(
-        r'\b[aà]s\s+(\d{1,2})(?:\s*(?:h(?:oras?)?|:\d{2}))?\b'  # as X / as Xh / as X horas
-        r'|(?<!\d)(\d{1,2}):\d{2}\b',                         # 21:00
+        r'\b[aà]s\s+(\d{1,2})(?:\s*(?:h(?:oras?)?|:\d{2}))?\b'
+        r'|(?<!\d)(\d{1,2}):\d{2}\b',
         rest, re.IGNORECASE
     )
     if hour_match:
@@ -126,25 +129,25 @@ def parse_prescription(text):
             specific_hour = h
             rest = (rest[:hour_match.start()] + rest[hour_match.end():]).strip()
 
-    # 5. Intervalo ("de 8/8h", "de 6/6 horas", "8/8h", "6h")
+    # 5. Intervalo ("de 8/8h", "6h", "6 horas")
     interval_hours = None
     if specific_hour is None:
         int_match = re.search(
-            r'(?:de\s+)?(\d+)\s*/\s*(\d+)\s*h(?:oras?)?'   # de 8/8h ou 8/8h
-            r'|(?:de\s+)?(\d+)\s*h(?:oras?)?'               # de 6h ou 6h ou 6horas
-            r'|(?:de\s+)?(\d+)\s+h(?:oras?)',                # 6 horas (com espaco)
+            r'(?:de\s+)?(\d+)\s*/\s*(\d+)\s*h(?:oras?)?'
+            r'|(?:de\s+)?(\d+)\s*h(?:oras?)?'
+            r'|(?:de\s+)?(\d+)\s+h(?:oras?)',
             rest, re.IGNORECASE
         )
         if int_match:
-            if int_match.group(1):     # X/Xh
+            if int_match.group(1):
                 interval_hours = float(int_match.group(1))
-            elif int_match.group(3):   # Xh
+            elif int_match.group(3):
                 interval_hours = float(int_match.group(3))
-            elif int_match.group(4):   # X horas
+            elif int_match.group(4):
                 interval_hours = float(int_match.group(4))
             rest = (rest[:int_match.start()] + rest[int_match.end():]).strip()
 
-    # 6. Texto do medicamento = o que sobrar limpo
+    # 6. Texto do medicamento
     med_text = re.sub(r'\s{2,}', ' ', rest).strip().rstrip(",.")
     if not med_text:
         return None
@@ -159,23 +162,63 @@ def parse_prescription(text):
     }
 
 
-# ----------------------------------------------------------------- CRUD
+def parse_receita_mode(text):
+    """
+    Determina o modo do comando /receita:
+    Retorna:
+      ('save_template', template_text)
+      ('apply_templates', phone, [ids], overrides_text)
+      ('inline', phone, rest_text)
+    """
+    t = text.strip()
+
+    # Sem telefone → salvar template
+    phone_match = re.match(r'^(\d{10,15})\s+(.*)', t)
+    if not phone_match:
+        return ('save_template', t)
+
+    phone = phone_match.group(1)
+    rest = phone_match.group(2).strip()
+
+    # Verifica se rest comeca com IDs de template (numeros 1-3 digitos)
+    OVERRIDE_KW = {'por', 'as', 'de', 'em', 'ate', 'a'}
+    tokens = rest.split()
+    numeric_prefix = []
+    for token in tokens:
+        if re.match(r'^\d{1,3}$', token):
+            numeric_prefix.append(int(token))
+        else:
+            break
+
+    if numeric_prefix:
+        remaining = tokens[len(numeric_prefix):]
+        first_remaining = remaining[0].lower().rstrip('.,') if remaining else ''
+        # Tambem aceita 'às' com acento
+        is_override = (not remaining or
+                       first_remaining in OVERRIDE_KW or
+                       first_remaining.startswith('\xe0'))  # 'à'
+        if is_override:
+            overrides = ' '.join(remaining)
+            return ('apply_templates', phone, numeric_prefix, overrides)
+
+    # Inline (comportamento existente)
+    return ('inline', phone, rest)
+
+
+# ----------------------------------------------------------------- CRUD prescricoes
 
 def add_prescription(patient_phone, med_text, condition_text,
                      interval_hours, specific_hour, duration_days):
-    """Salva prescricao e retorna o ID."""
     init_db()
     now = datetime.utcnow()
     now_brt = now - timedelta(hours=3)
     end_at = now_brt + timedelta(days=duration_days)
-
     next_dose = _next_dose_in_window(
         now_brt + (timedelta(minutes=5) if interval_hours else timedelta()),
         interval_hours, specific_hour
     )
     next_dose_utc = next_dose + timedelta(hours=3)
     end_utc = end_at + timedelta(hours=3)
-
     conn = _conn()
     cur = conn.execute("""
         INSERT INTO prescriptions
@@ -194,7 +237,6 @@ def add_prescription(patient_phone, med_text, condition_text,
 
 
 def get_due_prescriptions():
-    """Retorna prescricoes ativas com next_dose_at <= agora."""
     try:
         init_db()
         conn = _conn()
@@ -211,7 +253,6 @@ def get_due_prescriptions():
 
 
 def advance_next_dose(prescription_id, interval_hours, specific_hour):
-    """Atualiza next_dose_at para a proxima dose."""
     try:
         init_db()
         conn = _conn()
@@ -222,7 +263,6 @@ def advance_next_dose(prescription_id, interval_hours, specific_hour):
             return
         last_utc = datetime.fromisoformat(row["next_dose_at"])
         last_brt = last_utc - timedelta(hours=3)
-
         if specific_hour is not None:
             next_brt = last_brt + timedelta(days=1)
             next_brt = next_brt.replace(hour=specific_hour, minute=0, second=0, microsecond=0)
@@ -242,7 +282,6 @@ def advance_next_dose(prescription_id, interval_hours, specific_hour):
 
 
 def deactivate_expired():
-    """Desativa prescricoes vencidas."""
     try:
         init_db()
         conn = _conn()
@@ -255,7 +294,6 @@ def deactivate_expired():
 
 
 def cancel_prescription(prescription_id):
-    """Cancela prescricao pelo ID."""
     try:
         init_db()
         conn = _conn()
@@ -268,7 +306,6 @@ def cancel_prescription(prescription_id):
 
 
 def cancel_patient_prescriptions(patient_phone):
-    """Cancela todas as prescricoes ativas de um paciente. Retorna quantidade."""
     try:
         init_db()
         conn = _conn()
@@ -285,7 +322,6 @@ def cancel_patient_prescriptions(patient_phone):
 
 
 def list_active_prescriptions():
-    """Lista todas as prescricoes ativas."""
     try:
         init_db()
         conn = _conn()
@@ -300,7 +336,6 @@ def list_active_prescriptions():
 
 
 def format_active_prescriptions():
-    """Formata lista de prescricoes ativas para exibicao no WhatsApp."""
     rows = list_active_prescriptions()
     if not rows:
         return "Nenhuma prescricao ativa no momento."
@@ -312,22 +347,150 @@ def format_active_prescriptions():
             lines.append(f"*...{current_phone[-4:]}*")
         med = r["med_text"]
         cond = f" {r['condition_text']}" if r["condition_text"] else ""
-        if r["specific_hour"] is not None:
-            schedule = f"as {r['specific_hour']:02d}h diariamente"
-        else:
-            h = r["interval_hours"]
-            if h and h == int(h):
-                schedule = f"de {int(h)}/{int(h)}h"
-            elif h:
-                schedule = f"a cada {h}h"
-            else:
-                schedule = "horario nao detectado"
+        sched = format_schedule(r["specific_hour"], r["interval_hours"])
         end_brt = (datetime.fromisoformat(r["end_at"]) - timedelta(hours=3)).strftime("%d/%m")
-        lines.append(f"  #{r['id']} {med}{cond} -- {schedule} ate {end_brt}")
+        lines.append(f"  #{r['id']} {med}{cond} -- {sched} ate {end_brt}")
     return "\n".join(lines)
 
 
 def build_reminder_message(med_text, condition_text):
-    """Monta a mensagem de lembrete para o paciente."""
     cond = f" {condition_text}" if condition_text else ""
     return f"E hora de tomar {med_text}{cond}."
+
+
+# ----------------------------------------------------------------- templates
+
+def save_template(text):
+    """Parse texto sem telefone e salva como template numerado."""
+    dummy = f"5500000000000 {text.strip()}"
+    parsed = parse_prescription(dummy)
+    if not parsed:
+        return "Nao consegui interpretar. Formato: /receita: [med] [posologia] [duracao]"
+    init_db()
+    now = datetime.utcnow().isoformat()
+    conn = _conn()
+    cur = conn.execute("""
+        INSERT INTO prescription_templates
+          (text, med_text, condition_text, interval_hours, specific_hour, duration_days, created_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (text.strip(), parsed['med_text'], parsed['condition_text'],
+          parsed['interval_hours'], parsed['specific_hour'], parsed['duration_days'], now))
+    rowid = cur.lastrowid
+    conn.commit()
+    rows = conn.execute("SELECT id FROM prescription_templates ORDER BY id ASC").fetchall()
+    conn.close()
+    idx = next((i+1 for i, (r,) in enumerate(rows) if r == rowid), rowid)
+    sched = format_schedule(parsed['specific_hour'], parsed['interval_hours'])
+    cond = f" {parsed['condition_text']}" if parsed['condition_text'] else ""
+    return (f"Template *#{idx}* salvo:\n"
+            f"{parsed['med_text']}{cond} -- {sched} por {parsed['duration_days']}d\n\n"
+            f"Para prescrever: /receita: [tel] {idx}")
+
+
+def list_templates():
+    """Lista numerada de templates salvos."""
+    try:
+        init_db()
+        conn = _conn()
+        rows = conn.execute("""
+            SELECT id, med_text, condition_text, interval_hours, specific_hour, duration_days
+            FROM prescription_templates ORDER BY id ASC
+        """).fetchall()
+        conn.close()
+    except Exception:
+        return "Nenhum template cadastrado ainda."
+    if not rows:
+        return "Nenhum template cadastrado ainda.\nUse */receita: [texto sem numero]* para salvar."
+    lines = ["*Templates de prescricao:*\n"]
+    for i, row in enumerate(rows, 1):
+        rid, med, cond, interval, hour, dur = row
+        cond_str = f" {cond}" if cond else ""
+        sched = format_schedule(hour, interval)
+        lines.append(f"{i}. {med}{cond_str} -- {sched} por {dur}d")
+    lines.append("\n*Aplicar:* /receita: [tel] 1 2 3")
+    lines.append("*Sobrescrever:* /receita: [tel] 1 por 3 dias")
+    lines.append("*Apagar:* /apagar receita N")
+    return "\n".join(lines)
+
+
+def delete_template(n):
+    """Apaga template #n (base 1). Retorna mensagem de status."""
+    try:
+        init_db()
+        conn = _conn()
+        rows = conn.execute(
+            "SELECT id, med_text FROM prescription_templates ORDER BY id ASC"
+        ).fetchall()
+        if not (1 <= n <= len(rows)):
+            conn.close()
+            return f"Template #{n} nao encontrado. Use /templates para ver a lista."
+        rid, med = rows[n-1]
+        conn.execute("DELETE FROM prescription_templates WHERE id=?", (rid,))
+        conn.commit()
+        conn.close()
+        return f"Template *#{n}* ({med}) apagado."
+    except Exception as e:
+        return f"Erro ao apagar template: {e}"
+
+
+def _parse_overrides(text):
+    """Extrai campos de sobrescrita (duracao, horario, intervalo) do texto."""
+    if not text.strip():
+        return {}
+    dummy = f"5500000000000 placeholder {text}"
+    parsed = parse_prescription(dummy)
+    if not parsed:
+        return {}
+    overrides = {}
+    if re.search(r'\bpor\s+\d+\s*dias?\b', text, re.IGNORECASE):
+        overrides['duration_days'] = parsed['duration_days']
+    if parsed.get('specific_hour') is not None:
+        overrides['specific_hour'] = parsed['specific_hour']
+        overrides['interval_hours'] = None
+    elif parsed.get('interval_hours') is not None:
+        overrides['interval_hours'] = parsed['interval_hours']
+        overrides['specific_hour'] = None
+    return overrides
+
+
+def apply_templates(patient_phone, template_ids, overrides_text):
+    """
+    Aplica templates ao paciente com sobrescritas opcionais.
+    Retorna lista de (pid_ou_None, mensagem).
+    """
+    try:
+        init_db()
+        conn = _conn()
+        rows = conn.execute("""
+            SELECT id, med_text, condition_text, interval_hours, specific_hour, duration_days
+            FROM prescription_templates ORDER BY id ASC
+        """).fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+
+    overrides = _parse_overrides(overrides_text)
+    results = []
+
+    for tid in template_ids:
+        if not (1 <= tid <= len(rows)):
+            results.append((None, f"Template #{tid} nao encontrado."))
+            continue
+        rid, med, cond, interval, hour, dur = rows[tid-1]
+
+        final_dur = overrides.get('duration_days', dur)
+        if 'specific_hour' in overrides:
+            final_hour = overrides['specific_hour']
+            final_interval = None
+        elif 'interval_hours' in overrides:
+            final_hour = None
+            final_interval = overrides['interval_hours']
+        else:
+            final_hour = hour
+            final_interval = interval
+
+        pid = add_prescription(patient_phone, med, cond, final_interval, final_hour, final_dur)
+        sched = format_schedule(final_hour, final_interval)
+        results.append((pid, f"#{tid} {med} -- {sched} por {final_dur}d"))
+
+    return results

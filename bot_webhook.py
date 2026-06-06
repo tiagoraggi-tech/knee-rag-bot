@@ -17,7 +17,9 @@ from knee_prescriptions import (
     parse_prescription, add_prescription,
     get_due_prescriptions, advance_next_dose, deactivate_expired,
     cancel_prescription, cancel_patient_prescriptions,
-    format_active_prescriptions, build_reminder_message,
+    format_active_prescriptions, build_reminder_message, format_schedule,
+    parse_receita_mode, save_template, list_templates,
+    delete_template, apply_templates,
 )
 
 load_dotenv()
@@ -319,12 +321,16 @@ def messages_upsert():
                 send_whatsapp(phone, reply)
                 return jsonify({"status": "edit_mode_started"}), 200
 
-            # /apagar N — remove protocolo por indice
+            # /apagar receita N — apaga template; /apagar N — remove protocolo
             if text_lower.startswith("/apagar "):
                 raw = text[8:].strip()
-                reply = delete_protocol_by_index(int(raw)) if raw.isdigit() else "❌ Use: /apagar N  (ex: /apagar 2)"
+                if raw.lower().startswith("receita "):
+                    n_str = raw[8:].strip()
+                    reply = delete_template(int(n_str)) if n_str.isdigit() else "❌ Use: /apagar receita N"
+                else:
+                    reply = delete_protocol_by_index(int(raw)) if raw.isdigit() else "❌ Use: /apagar N  (ex: /apagar 2)"
                 send_whatsapp(phone, reply)
-                return jsonify({"status": "protocol_deleted"}), 200
+                return jsonify({"status": "deleted"}), 200
 
             # /consultar N: pergunta
             if text_lower.startswith("/consultar "):
@@ -374,45 +380,64 @@ def messages_upsert():
                 send_whatsapp(phone, reply)
                 return jsonify({"status": "protocol_removed"}), 200
 
-            # /receita: telefone medicamento ... de X/Xh [em caso de Y] [por Z dias]
+            # /receita: — salvar template, aplicar templates ou prescrever inline
             if text_lower.startswith("/receita:"):
                 body = text[len("/receita:"):].strip()
-                parsed = parse_prescription(body)
-                if not parsed:
-                    reply = ("❌ Formato:\n"
-                             "/receita: 55249XXXXXXX tramadol 50mg 1 comp VO de 8/8h em caso de dor por 5 dias\n"
-                             "/receita: 55249XXXXXXX pregabalina 75mg 1 comp VO às 21h por 30 dias")
-                else:
-                    pid = add_prescription(
-                        patient_phone=parsed["patient_phone"],
-                        med_text=parsed["med_text"],
-                        condition_text=parsed["condition_text"],
-                        interval_hours=parsed["interval_hours"],
-                        specific_hour=parsed["specific_hour"],
-                        duration_days=parsed["duration_days"],
-                    )
-                    cond_str = f" {parsed['condition_text']}" if parsed["condition_text"] else ""
-                    if parsed["specific_hour"] is not None:
-                        sched_str = f"às {parsed['specific_hour']:02d}h diariamente"
+                if not body:
+                    reply = ("❌ Uso:\n"
+                             "Salvar template: /receita: tramadol 50mg 1 comp de 8/8h por 5 dias\n"
+                             "Aplicar:         /receita: 55249XXXXXXX 1 2 3\n"
+                             "Inline:          /receita: 55249XXXXXXX tramadol 50mg 1 comp de 8/8h")
+                    send_whatsapp(phone, reply)
+                    return jsonify({"status": "receita_help"}), 200
+                mode_result = parse_receita_mode(body)
+                if mode_result[0] == 'save_template':
+                    reply = save_template(mode_result[1])
+                elif mode_result[0] == 'apply_templates':
+                    _, pat_phone, tids, overrides_text = mode_result
+                    results = apply_templates(pat_phone, tids, overrides_text)
+                    lines = [f"📱 Paciente: *...{pat_phone[-4:]}*\n"]
+                    for pid, msg in results:
+                        lines.append(f"✅ Prescrição #{pid} — {msg}" if pid else f"❌ {msg}")
+                    reply = "\n".join(lines)
+                else:  # inline
+                    _, pat_phone, rest_text = mode_result
+                    parsed = parse_prescription(f"{pat_phone} {rest_text}")
+                    if not parsed:
+                        reply = ("❌ Formato:\n"
+                                 "/receita: 55249XXXXXXX tramadol 50mg 1 comp de 8/8h por 5 dias\n"
+                                 "/receita: 55249XXXXXXX pregabalina 75mg 1 comp às 21h por 30 dias")
                     else:
-                        h = parsed["interval_hours"]
-                        sched_str = (f"de {int(h)}/{int(h)}h" if h and h == int(h)
-                                     else f"a cada {h}h" if h else "horário não detectado")
-                    reply = (f"✅ Prescrição #{pid} criada\n"
-                             f"📱 Paciente: *...{parsed['patient_phone'][-4:]}*\n"
-                             f"💊 {parsed['med_text']}{cond_str}\n"
-                             f"⏱ {sched_str} por {parsed['duration_days']} dias")
+                        pid = add_prescription(
+                            patient_phone=parsed["patient_phone"],
+                            med_text=parsed["med_text"],
+                            condition_text=parsed["condition_text"],
+                            interval_hours=parsed["interval_hours"],
+                            specific_hour=parsed["specific_hour"],
+                            duration_days=parsed["duration_days"],
+                        )
+                        cond_str = f" {parsed['condition_text']}" if parsed["condition_text"] else ""
+                        sched_str = format_schedule(parsed['specific_hour'], parsed['interval_hours'])
+                        reply = (f"✅ Prescrição #{pid} criada\n"
+                                 f"📱 Paciente: *...{parsed['patient_phone'][-4:]}*\n"
+                                 f"💊 {parsed['med_text']}{cond_str}\n"
+                                 f"⏱ {sched_str} por {parsed['duration_days']} dias")
                 send_whatsapp(phone, reply)
-                return jsonify({"status": "prescription_created"}), 200
+                return jsonify({"status": "prescription_handled"}), 200
 
             # /receitas — lista prescrições ativas
             if text_lower in ("/receitas", "/ver_receitas"):
                 send_whatsapp(phone, format_active_prescriptions())
                 return jsonify({"status": "prescriptions_listed"}), 200
 
-            # /cancelar_receita: ID ou telefone
-            if text_lower.startswith("/cancelar_receita:"):
-                arg = text[len("/cancelar_receita:"):].strip()
+            # /templates — lista templates de prescrição
+            if text_lower == "/templates":
+                send_whatsapp(phone, list_templates())
+                return jsonify({"status": "templates_listed"}), 200
+
+            # /cancelar_prescrição: ID ou telefone
+            if text_lower.startswith("/cancelar_prescrição:"):
+                arg = text[len("/cancelar_prescrição:"):].strip()
                 if arg.isdigit():
                     ok = cancel_prescription(int(arg))
                     reply = f"✅ Prescrição #{arg} cancelada." if ok else f"❌ Prescrição #{arg} não encontrada."
@@ -421,7 +446,7 @@ def messages_upsert():
                     reply = (f"✅ {count} prescrição(ões) cancelada(s) para *...{arg[-4:]}*."
                              if count else f"❌ Nenhuma prescrição ativa para *...{arg[-4:]}*.")
                 else:
-                    reply = "❌ Use: /cancelar_receita: ID  ou  /cancelar_receita: 55249XXXXXXX"
+                    reply = "❌ Use: /cancelar_prescrição: ID  ou  /cancelar_prescrição: 55249XXXXXXX"
                 send_whatsapp(phone, reply)
                 return jsonify({"status": "prescription_cancelled"}), 200
 
@@ -499,7 +524,7 @@ def admin_ingest():
     return jsonify({"status": "ingest_started", "message": "Verifique os logs do Railway"}), 202
 
 def _prescription_reminder_worker():
-    """Thread de fundo: envia lembretes de medicação a cada 5 minutos."""
+    """Thread de fundo: envia lembretes de medicacao a cada 5 minutos."""
     import time as _time
     while True:
         try:
