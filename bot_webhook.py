@@ -150,6 +150,73 @@ def handle_admin_patient_session(phone: str, text: str) -> str | None:
         if len(sess["history"]) > 10: sess["history"] = sess["history"][-10:]
     return reply or message
 
+
+def llm_interpret_admin_intent(text: str) -> dict:
+    """
+    Interpreta intenção do admin e normaliza para um comando executável.
+    Retorna {"command": "/cmd...", "explanation": "desc"} ou {"command": None, "explanation": "msg"}
+    """
+    import re as _re_i, json as _json_i
+    try:
+        protos_ctx = list_protocols()
+    except Exception:
+        protos_ctx = "(indisponivel)"
+    try:
+        tmpls_ctx = list_templates()
+    except Exception:
+        tmpls_ctx = "(indisponivel)"
+    try:
+        pats_ctx = list_patient_assignments()
+    except Exception:
+        pats_ctx = "(indisponivel)"
+
+    sys_prompt = (
+        "Voce e o interpretador de comandos do Dr. Tiago Raggi (ortopedista).\n"
+        "Dado o texto que ele enviou, determine o comando correto e normalize-o.\n"
+        "Responda SOMENTE com JSON valido, sem texto fora do JSON.\n\n"
+        "COMANDOS DISPONIVEIS:\n"
+        "/instrucao {Titulo}: {conteudo}          salva protocolo clinico\n"
+        "/{N}: {telefone}                          vincula protocolo #N ao paciente\n"
+        "/ver_comandos                             lista todos os comandos\n"
+        "/ver {N}                                  mostra protocolo #N\n"
+        "/editar {N}                               edita protocolo #N\n"
+        "/apagar {N}                               apaga protocolo #N\n"
+        "/consultar {N}: {pergunta}                consulta protocolo #N com IA\n"
+        "/ver_pacientes                            lista pacientes vinculados\n"
+        "/ver_paciente {N}                         detalhe do paciente #N\n"
+        "/remover_protocolo {N}: {Titulo}          desvincula protocolo do paciente\n"
+        "/receita: {tel} {med} {posologia} {dur}   prescricao inline\n"
+        "/receita: {texto sem tel}                 salva template de prescricao\n"
+        "/receita: {tel} {N1} {N2} [por X dias]   aplica templates ao paciente\n"
+        "/templates                                lista templates salvos\n"
+        "/apagar receita {N}                       apaga template #N\n"
+        "/cancelar_prescricao: {ID ou tel}         cancela prescricao (sem acento)\n"
+        "/receitas                                 lista prescricoes ativas\n"
+        "/estudo                                   ativa modo estudo clinico\n\n"
+        "FORMATO JSON:\n"
+        '{"command": "/comando completo normalizado", "explanation": "O que vai ser feito (pt-BR, 1 linha)"}\n'
+        "Se nao conseguir mapear: {\"command\": null, \"explanation\": \"resposta ao Dr. Tiago\"}\n"
+        "Se e uma pergunta clinica: {\"command\": \"/estudo\", \"explanation\": \"Ativar modo estudo\"}\n\n"
+        f"DADOS ATUAIS:\nProtocolos: {protos_ctx}\nTemplates: {tmpls_ctx}\nPacientes: {pats_ctx}"
+    )
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY','')}", "Content-Type": "application/json"},
+            json={"model": "llama-3.1-8b-instant",
+                  "messages": [{"role": "system", "content": sys_prompt},
+                                {"role": "user", "content": f'Dr. Tiago enviou: "{text}"'}],
+                  "max_tokens": 250, "temperature": 0},
+            timeout=10
+        )
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        m = _re_i.search(r'\{.*\}', raw, _re_i.DOTALL)
+        if m:
+            return _json_i.loads(m.group())
+    except Exception as e:
+        log.warning("llm_interpret_admin_intent: %s", e)
+    return {"command": None, "explanation": "Nao entendi. Use /ver_comandos para ver as opcoes."}
+
 MAX_SEEN = 2000
 MAX_AGE_SECONDS = 60
 
@@ -266,6 +333,35 @@ def messages_upsert():
                 del _protocol_sessions[phone]
                 send_whatsapp(phone, reply)
                 return jsonify({"status": "protocol_edited"}), 200
+
+            # Confirmacao pendente: admin responde "sim" ou "nao"
+            psess2 = _protocol_sessions.get(phone)
+            if psess2 and psess2.get("mode") == "pending_confirmation":
+                answer = text_lower.strip().rstrip("!.")
+                if answer in ("sim", "s", "confirmar", "confirma", "ok", "yes"):
+                    pending_cmd = psess2["command"]
+                    del _protocol_sessions[phone]
+                    # Normaliza variações sem acento geradas pelo LLM
+                    _alias = {
+                        "/cancelar_prescricao:": "/cancelar_prescrição:",
+                        "/cancelar_receita:": "/cancelar_prescrição:",
+                    }
+                    _lc = pending_cmd.lower()
+                    for _a, _b in _alias.items():
+                        if _lc.startswith(_a):
+                            pending_cmd = _b + pending_cmd[len(_a):]
+                            break
+                    text = pending_cmd
+                    text_lower = pending_cmd.lower().strip()
+                    log.info("Admin confirmou comando: %s", pending_cmd[:60])
+                    # Cai nos handlers abaixo com o comando normalizado
+                elif answer in ("nao", "n", "cancelar", "cancel", "no", "nope"):
+                    del _protocol_sessions[phone]
+                    send_whatsapp(phone, "❌ Comando cancelado.")
+                    return jsonify({"status": "cancelled"}), 200
+                else:
+                    # Trata como nova intenção: descarta confirmação anterior
+                    del _protocol_sessions[phone]
 
             # /N: phone — vincula protocolo #N ao paciente
             _assign_m = _re_admin.match(r'^/(\d+):\s*(\d+)', text.strip())
@@ -450,31 +546,36 @@ def messages_upsert():
                 send_whatsapp(phone, reply)
                 return jsonify({"status": "prescription_cancelled"}), 200
 
-            # Gestao de pacientes via LLM (linguagem natural sem /)
-            if not text_lower.startswith("/"):
-                _patient_reply = handle_admin_patient_session(phone, text)
-                if _patient_reply is not None:
-                    send_whatsapp(phone, _patient_reply)
-                    return jsonify({"status": "admin_patient_session"}), 200
+            # Interpretador LLM unificado: qualquer mensagem que chegou ate aqui
+            # nao foi reconhecida como comando exato — LLM interpreta a intencao
+            intent = llm_interpret_admin_intent(text)
+            cmd = (intent.get("command") or "").strip()
+            explanation = intent.get("explanation", "")
 
-            # LLM natural language protocol assignment
-            try:
-                import re as _re2, json as _json2, requests as _req2
-                _protos_raw = list_protocols()
-                _llm_msg = f'Admin enviou: "{text}"\nProtocolos: {_protos_raw}\nSe pede vincular protocolo a paciente, responda JSON: {{"protocolo":"titulo","telefone":"numeros"}}. Caso contrario: null'
-                _gr = _req2.post("https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}", "Content-Type": "application/json"},
-                    json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": _llm_msg}], "max_tokens": 80, "temperature": 0},
-                    timeout=8)
-                _lt = _gr.json()["choices"][0]["message"]["content"].strip()
-                if _lt and _lt != "null":
-                    _pd = _json2.loads(_lt)
-                    if _pd and _pd.get("protocolo") and _pd.get("telefone"):
-                        reply = assign_protocol(_pd["telefone"], _pd["protocolo"], phone)
-                        send_whatsapp(phone, reply)
-                        return jsonify({"status": "protocol_assigned_llm"}), 200
-            except Exception as _e:
-                log.warning("LLM admin parse: %s", _e)
+            # Comando especial: /estudo direto (nao precisa de confirmacao)
+            if cmd == "/estudo":
+                _protocol_sessions[phone] = {"mode": "study", "history": []}
+                reply = (
+                    "🩺 *Modo estudo ativado.*" + chr(10) + chr(10) +
+                    "Faca suas perguntas clinicas — vou buscar na literatura do joelho" + chr(10) +
+                    "e responder com profundidade tecnica." + chr(10) +
+                    "Digite */sair* para encerrar."
+                )
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "study_mode_started_llm"}), 200
+
+            if cmd:
+                _protocol_sessions[phone] = {"mode": "pending_confirmation", "command": cmd}
+                reply = (f"🤖 Interpretei como:" + chr(10) +
+                         f"`{cmd}`" + chr(10) + chr(10) +
+                         f"_{explanation}_" + chr(10) + chr(10) +
+                         "Confirma? (*sim* / *não*)")
+                send_whatsapp(phone, reply)
+                return jsonify({"status": "intent_pending"}), 200
+
+            # LLM nao conseguiu mapear
+            send_whatsapp(phone, explanation or "Nao entendi. Use /ver_comandos para ver as opcoes.")
+            return jsonify({"status": "unknown_command"}), 200
 
         # Resposta ao paciente
         phone_hash = hashlib.md5(phone.encode()).hexdigest()
