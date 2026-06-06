@@ -1,13 +1,13 @@
 """
-knee_prescriptions.py — Gerenciamento de prescrições e lembretes de medicação via WhatsApp.
+knee_prescriptions.py -- Gerenciamento de prescricoes e lembretes de medicacao via WhatsApp.
 
 Comando: /receita: 55249XXXXXXX tramadol 50mg 1 comp VO de 8/8h em caso de dor por 5 dias
-         /receita: 55249XXXXXXX pregabalina 75mg 1 comp VO às 21h por 30 dias
+         /receita: 55249XXXXXXX pregabalina 75mg 1 comp VO as 21h por 30 dias
 
 Regras:
 - Lembretes somente entre 06:00 e 00:00
-- Horário específico ("às Xh") tem prioridade sobre intervalo
-- Duração padrão: 7 dias se não informada
+- Horario especifico ("as Xh") tem prioridade sobre intervalo
+- Duracao padrao: 7 dias se nao informada
 - "em caso de X" entra na mensagem do lembrete quando presente
 """
 
@@ -22,7 +22,7 @@ HOUR_MIN = 6    # 06:00
 HOUR_MAX = 24   # 00:00 (meia-noite)
 
 
-# ─────────────────────────── banco ───────────────────────────
+# ----------------------------------------------------------------- banco
 
 def _conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -53,93 +53,95 @@ def init_db():
     conn.close()
 
 
-# ─────────────────────────── parsing ───────────────────────────
+# ----------------------------------------------------------------- parsing
 
-def _next_dose_in_window(base_dt: datetime, interval_hours: float | None,
-                          specific_hour: int | None) -> datetime:
+def _next_dose_in_window(base_dt, interval_hours, specific_hour):
     """
-    Calcula a primeira dose a partir de base_dt que cai dentro da janela 06h–00h.
-    - specific_hour: dose diária nessa hora exata
-    - interval_hours: próxima dose = base_dt + interval, deslocada se fora da janela
+    Calcula a primeira dose a partir de base_dt que cai dentro da janela 06h-00h.
+    - specific_hour: dose diaria nessa hora exata
+    - interval_hours: proxima dose = base_dt + interval, deslocada se fora da janela
     """
     if specific_hour is not None:
-        # Dose diária em hora fixa — encontra o próximo horário válido
         candidate = base_dt.replace(hour=specific_hour, minute=0, second=0, microsecond=0)
         if candidate <= base_dt:
             candidate += timedelta(days=1)
         return candidate
 
-    # Intervalo livre
     candidate = base_dt
-    for _ in range(48):  # max 2 dias de tentativas
+    for _ in range(48):
         if HOUR_MIN <= candidate.hour < HOUR_MAX:
             return candidate
-        # Fora da janela: avança para 06:00 do próximo dia
         candidate = (candidate + timedelta(days=1)).replace(
             hour=HOUR_MIN, minute=0, second=0, microsecond=0
         )
     return candidate
 
 
-def parse_prescription(text: str) -> dict | None:
+def parse_prescription(text):
     """
-    Extrai campos de uma prescrição a partir do texto após '/receita:'.
-    Retorna dict ou None se inválido.
+    Extrai campos de uma prescricao a partir do texto apos '/receita:'.
+    Retorna dict ou None se invalido.
 
     Exemplos:
       "55249XXXXXXX tramadol 50mg 1 comp VO de 8/8h em caso de dor por 5 dias"
-      "55249XXXXXXX pregabalina 75mg 1 comp VO às 21h por 30 dias"
+      "55249XXXXXXX pregabalina 75mg 1 comp VO as 21h por 30 dias"
       "55249XXXXXXX dipirona 500mg 1 comp VO de 6/6h"
     """
     t = text.strip()
 
-    # 1. Extrai telefone (primeiro token numérico ≥ 10 dígitos)
+    # 1. Extrai telefone (primeiro token numerico >= 10 digitos)
     phone_match = re.match(r'^(\d{10,15})\s+', t)
     if not phone_match:
         return None
     patient_phone = phone_match.group(1)
     rest = t[phone_match.end():].strip()
 
-    # 2. Duração ("por X dias")
+    # 2. Duracao ("por X dias")
     duration_days = 7
     dur_match = re.search(r'\bpor\s+(\d+)\s*dias?\b', rest, re.IGNORECASE)
     if dur_match:
         duration_days = int(dur_match.group(1))
         rest = (rest[:dur_match.start()] + rest[dur_match.end():]).strip()
 
-    # 3. Condição ("em caso de ...")
+    # 3. Condicao ("em caso de ...")
     condition_text = ""
-    cond_match = re.search(r'\bem\s+caso\s+de\s+(.+?)(?=\bpor\b|\bde\s+\d|\bàs\b|$)',
+    cond_match = re.search(r'\bem\s+caso\s+de\s+(.+?)(?=\bpor\b|\bde\s+\d|\bas\b|$)',
                            rest, re.IGNORECASE)
     if cond_match:
         condition_text = "em caso de " + cond_match.group(1).strip().rstrip(",. ")
         rest = (rest[:cond_match.start()] + rest[cond_match.end():]).strip()
 
-    # 4. Horário específico ("às 21h", "às 21 horas", "21h", "21:00")
+    # 4. Horario especifico -- SOMENTE quando "as/as" esta presente ou formato HH:MM
+    #    Aceita: "as 21h", "as 21 horas", "as 21", "21:00"
+    #    NAO aceita "8h" sozinho (isso eh intervalo)
     specific_hour = None
     hour_match = re.search(
-        r'(?:às\s+)?(\d{1,2})(?:h(?:oras?)?|:\d{2})\b',
+        r'\bas\s+(\d{1,2})(?:\s*(?:h(?:oras?)?|:\d{2}))?\b'  # as X / as Xh / as X horas
+        r'|(?<!\d)(\d{1,2}):\d{2}\b',                         # 21:00
         rest, re.IGNORECASE
     )
     if hour_match:
-        h = int(hour_match.group(1))
+        h = int(hour_match.group(1) if hour_match.group(1) is not None else hour_match.group(2))
         if 0 <= h <= 23:
             specific_hour = h
             rest = (rest[:hour_match.start()] + rest[hour_match.end():]).strip()
 
-    # 5. Intervalo ("de 8/8h", "de 6/6 horas", "8/8h", "6h em 6h")
+    # 5. Intervalo ("de 8/8h", "de 6/6 horas", "8/8h", "6h")
     interval_hours = None
     if specific_hour is None:
         int_match = re.search(
-            r'(?:de\s+)?(\d+)\s*/\s*(\d+)\s*h(?:oras?)?'
-            r'|(?:de\s+)?(\d+)\s*h(?:oras?)?(?:\s+em\s+\d+\s*h(?:oras?)?)?',
+            r'(?:de\s+)?(\d+)\s*/\s*(\d+)\s*h(?:oras?)?'   # de 8/8h ou 8/8h
+            r'|(?:de\s+)?(\d+)\s*h(?:oras?)?'               # de 6h ou 6h ou 6horas
+            r'|(?:de\s+)?(\d+)\s+h(?:oras?)',                # 6 horas (com espaco)
             rest, re.IGNORECASE
         )
         if int_match:
-            if int_match.group(1):  # formato X/Xh
+            if int_match.group(1):     # X/Xh
                 interval_hours = float(int_match.group(1))
-            elif int_match.group(3):  # formato Xh
+            elif int_match.group(3):   # Xh
                 interval_hours = float(int_match.group(3))
+            elif int_match.group(4):   # X horas
+                interval_hours = float(int_match.group(4))
             rest = (rest[:int_match.start()] + rest[int_match.end():]).strip()
 
     # 6. Texto do medicamento = o que sobrar limpo
@@ -157,15 +159,13 @@ def parse_prescription(text: str) -> dict | None:
     }
 
 
-# ─────────────────────────── CRUD ───────────────────────────
+# ----------------------------------------------------------------- CRUD
 
-def add_prescription(patient_phone: str, med_text: str, condition_text: str,
-                     interval_hours: float | None, specific_hour: int | None,
-                     duration_days: int) -> int:
-    """Salva prescrição e retorna o ID."""
+def add_prescription(patient_phone, med_text, condition_text,
+                     interval_hours, specific_hour, duration_days):
+    """Salva prescricao e retorna o ID."""
     init_db()
     now = datetime.utcnow()
-    # Converte UTC → BRT (UTC-3) para cálculo de janela de horário
     now_brt = now - timedelta(hours=3)
     end_at = now_brt + timedelta(days=duration_days)
 
@@ -173,7 +173,6 @@ def add_prescription(patient_phone: str, med_text: str, condition_text: str,
         now_brt + (timedelta(minutes=5) if interval_hours else timedelta()),
         interval_hours, specific_hour
     )
-    # Armazena em UTC
     next_dose_utc = next_dose + timedelta(hours=3)
     end_utc = end_at + timedelta(hours=3)
 
@@ -190,12 +189,12 @@ def add_prescription(patient_phone: str, med_text: str, condition_text: str,
     pid = cur.lastrowid
     conn.commit()
     conn.close()
-    log.info("Prescrição #%d criada: %s para *%s", pid, med_text[:40], patient_phone[-4:])
+    log.info("Prescricao #%d criada: %s para *%s", pid, med_text[:40], patient_phone[-4:])
     return pid
 
 
-def get_due_prescriptions() -> list[sqlite3.Row]:
-    """Retorna prescrições ativas com next_dose_at <= agora."""
+def get_due_prescriptions():
+    """Retorna prescricoes ativas com next_dose_at <= agora."""
     try:
         init_db()
         conn = _conn()
@@ -211,9 +210,8 @@ def get_due_prescriptions() -> list[sqlite3.Row]:
         return []
 
 
-def advance_next_dose(prescription_id: int, interval_hours: float,
-                       specific_hour: int | None):
-    """Atualiza next_dose_at para a próxima dose."""
+def advance_next_dose(prescription_id, interval_hours, specific_hour):
+    """Atualiza next_dose_at para a proxima dose."""
     try:
         init_db()
         conn = _conn()
@@ -230,7 +228,6 @@ def advance_next_dose(prescription_id: int, interval_hours: float,
             next_brt = next_brt.replace(hour=specific_hour, minute=0, second=0, microsecond=0)
         else:
             next_brt = last_brt + timedelta(hours=interval_hours)
-            # Desloca para janela válida
             if not (HOUR_MIN <= next_brt.hour < HOUR_MAX):
                 next_brt = (next_brt + timedelta(days=1)).replace(
                     hour=HOUR_MIN, minute=0, second=0, microsecond=0
@@ -245,7 +242,7 @@ def advance_next_dose(prescription_id: int, interval_hours: float,
 
 
 def deactivate_expired():
-    """Desativa prescrições vencidas."""
+    """Desativa prescricoes vencidas."""
     try:
         init_db()
         conn = _conn()
@@ -257,8 +254,8 @@ def deactivate_expired():
         log.warning("deactivate_expired: %s", e)
 
 
-def cancel_prescription(prescription_id: int) -> bool:
-    """Cancela prescrição pelo ID."""
+def cancel_prescription(prescription_id):
+    """Cancela prescricao pelo ID."""
     try:
         init_db()
         conn = _conn()
@@ -270,8 +267,8 @@ def cancel_prescription(prescription_id: int) -> bool:
         return False
 
 
-def cancel_patient_prescriptions(patient_phone: str) -> int:
-    """Cancela todas as prescrições ativas de um paciente. Retorna quantidade."""
+def cancel_patient_prescriptions(patient_phone):
+    """Cancela todas as prescricoes ativas de um paciente. Retorna quantidade."""
     try:
         init_db()
         conn = _conn()
@@ -287,8 +284,8 @@ def cancel_patient_prescriptions(patient_phone: str) -> int:
         return 0
 
 
-def list_active_prescriptions() -> list[sqlite3.Row]:
-    """Lista todas as prescrições ativas."""
+def list_active_prescriptions():
+    """Lista todas as prescricoes ativas."""
     try:
         init_db()
         conn = _conn()
@@ -302,30 +299,35 @@ def list_active_prescriptions() -> list[sqlite3.Row]:
         return []
 
 
-def format_active_prescriptions() -> str:
-    """Formata lista de prescrições ativas para exibição no WhatsApp."""
+def format_active_prescriptions():
+    """Formata lista de prescricoes ativas para exibicao no WhatsApp."""
     rows = list_active_prescriptions()
     if not rows:
-        return "📋 Nenhuma prescrição ativa no momento."
-    lines = ["📋 *Prescrições ativas:*\n"]
+        return "Nenhuma prescricao ativa no momento."
+    lines = ["*Prescricoes ativas:*\n"]
     current_phone = None
     for r in rows:
         if r["patient_phone"] != current_phone:
             current_phone = r["patient_phone"]
-            lines.append(f"👤 *...{current_phone[-4:]}*")
+            lines.append(f"*...{current_phone[-4:]}*")
         med = r["med_text"]
         cond = f" {r['condition_text']}" if r["condition_text"] else ""
         if r["specific_hour"] is not None:
-            schedule = f"às {r['specific_hour']:02d}h diariamente"
+            schedule = f"as {r['specific_hour']:02d}h diariamente"
         else:
             h = r["interval_hours"]
-            schedule = f"de {int(h)}/{int(h)}h" if h and h == int(h) else f"a cada {h}h"
+            if h and h == int(h):
+                schedule = f"de {int(h)}/{int(h)}h"
+            elif h:
+                schedule = f"a cada {h}h"
+            else:
+                schedule = "horario nao detectado"
         end_brt = (datetime.fromisoformat(r["end_at"]) - timedelta(hours=3)).strftime("%d/%m")
-        lines.append(f"  #{r['id']} {med}{cond} — {schedule} até {end_brt}")
+        lines.append(f"  #{r['id']} {med}{cond} -- {schedule} ate {end_brt}")
     return "\n".join(lines)
 
 
-def build_reminder_message(med_text: str, condition_text: str) -> str:
+def build_reminder_message(med_text, condition_text):
     """Monta a mensagem de lembrete para o paciente."""
     cond = f" {condition_text}" if condition_text else ""
-    return f"⏰ É hora de tomar {med_text}{cond}."
+    return f"E hora de tomar {med_text}{cond}."
