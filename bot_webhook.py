@@ -217,6 +217,77 @@ def llm_interpret_admin_intent(text: str) -> dict:
         log.warning("llm_interpret_admin_intent: %s", e)
     return {"command": None, "explanation": "Nao entendi. Use /ver_comandos para ver as opcoes."}
 
+
+def llm_apoio_admin(query: str) -> str:
+    """
+    Assistente de uso dos comandos: lê toda a tabela de comandos e dados contextuais,
+    responde em linguagem natural explicando COMO usar o comando certo para o que o
+    Dr. Tiago quer fazer, incluindo o comando exato formatado para colar.
+    """
+    try:
+        protos_ctx = list_protocols()
+    except Exception:
+        protos_ctx = "(indisponivel)"
+    try:
+        tmpls_ctx = list_templates()
+    except Exception:
+        tmpls_ctx = "(indisponivel)"
+    try:
+        pats_ctx = list_patient_assignments()
+    except Exception:
+        pats_ctx = "(indisponivel)"
+
+    sys_prompt = (
+        "Voce e o assistente de comandos do Dr. Tiago Raggi (ortopedista).\n"
+        "Ele vai descrever o que quer fazer e voce deve:\n"
+        "1. Identificar o(s) comando(s) necessario(s)\n"
+        "2. Explicar brevemente o que cada um faz\n"
+        "3. Fornecer o comando EXATO ja formatado e pronto para colar\n"
+        "Responda em portugues, de forma direta e pratica. Use *negrito* para destacar comandos.\n\n"
+        "TABELA COMPLETA DE COMANDOS:\n"
+        "-- PROTOCOLOS --\n"
+        "/instrucao {Titulo}: {conteudo}       salva novo protocolo clinico\n"
+        "/{N}: {telefone}                       vincula protocolo #N ao paciente\n"
+        "/ver {N}                               mostra conteudo do protocolo #N\n"
+        "/editar {N}                            entra em modo edicao do protocolo #N\n"
+        "/apagar {N}                            apaga protocolo #N permanentemente\n"
+        "/consultar {N}: {pergunta}             pergunta ao LLM sobre o protocolo #N\n"
+        "/ver_pacientes                         lista todos os pacientes vinculados\n"
+        "/ver_paciente {N}                      detalhes do paciente na posicao #N\n"
+        "/remover_protocolo {N}: {Titulo}       desvincula protocolo do paciente\n"
+        "/estudo                                ativa modo estudo clinico (perguntas livres)\n\n"
+        "-- PRESCRICOES --\n"
+        "/receita: {tel} {med} {dose} {freq} por {X} dias   prescricao direta (inline)\n"
+        "/receita: {texto sem telefone}         salva como template de prescricao\n"
+        "/receita: {tel} {N1} {N2} ...          aplica templates #N1 #N2... ao paciente\n"
+        "/receita: {tel} {N1} por {X} dias      aplica template com duracao customizada\n"
+        "/templates                             lista todos os templates salvos\n"
+        "/apagar receita {N}                    apaga template #N\n"
+        "/cancelar_prescricao: {ID}             cancela prescricao pelo ID numerico\n"
+        "/cancelar_prescricao: {telefone}       cancela todas as prescricoes ativas do paciente\n"
+        "/receitas                              lista todas as prescricoes ativas\n\n"
+        "-- OUTROS --\n"
+        "/ver_comandos                          exibe este painel completo de comandos\n"
+        "/apoio: {descricao}                    peça ajuda para usar qualquer comando (este!)\n\n"
+        f"DADOS ATUAIS:\nProtocolos cadastrados: {protos_ctx}\n"
+        f"Templates de prescricao: {tmpls_ctx}\n"
+        f"Pacientes vinculados: {pats_ctx}"
+    )
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY','')}", "Content-Type": "application/json"},
+            json={"model": "llama-3.3-70b-versatile",
+                  "messages": [{"role": "system", "content": sys_prompt},
+                                {"role": "user", "content": query}],
+                  "max_tokens": 600, "temperature": 0.2},
+            timeout=15
+        )
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning("llm_apoio_admin: %s", e)
+        return "❌ Não consegui consultar o assistente agora. Use /ver_comandos para ver a lista completa."
+
 MAX_SEEN = 2000
 MAX_AGE_SECONDS = 60
 
@@ -525,6 +596,16 @@ def messages_upsert():
             if text_lower in ("/receitas", "/ver_receitas"):
                 send_whatsapp(phone, format_active_prescriptions())
                 return jsonify({"status": "prescriptions_listed"}), 200
+
+            # /apoio: — assistente de uso dos comandos
+            if text_lower.startswith("/apoio:"):
+                query = text[len("/apoio:"):].strip()
+                if not query:
+                    send_whatsapp(phone, "💡 Use: */apoio:* o que quero fazer\nEx: /apoio: quero cancelar as prescrições do paciente 5521999...")
+                    return jsonify({"status": "apoio_hint"}), 200
+                resposta = llm_apoio_admin(query)
+                send_whatsapp(phone, resposta)
+                return jsonify({"status": "apoio_ok"}), 200
 
             # /templates — lista templates de prescrição
             if text_lower == "/templates":
