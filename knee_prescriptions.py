@@ -261,18 +261,34 @@ def advance_next_dose(prescription_id, interval_hours, specific_hour):
         if not row:
             conn.close()
             return
-        last_utc = datetime.fromisoformat(row["next_dose_at"])
-        last_brt = last_utc - timedelta(hours=3)
-        if specific_hour is not None:
-            next_brt = last_brt + timedelta(days=1)
-            next_brt = next_brt.replace(hour=specific_hour, minute=0, second=0, microsecond=0)
+        # Usa o MAIOR entre o horário agendado e agora para evitar loop de reenvio
+        scheduled_utc = datetime.fromisoformat(row["next_dose_at"])
+        now_utc = datetime.utcnow()
+        base_utc = max(scheduled_utc, now_utc)
+        base_brt = base_utc - timedelta(hours=3)
+
+        # Garante valores válidos — se ambos None, assume intervalo diário
+        _interval = interval_hours if interval_hours is not None else 24
+        _spec = int(specific_hour) if specific_hour is not None else None
+
+        if _spec is not None:
+            next_brt = base_brt + timedelta(days=1)
+            next_brt = next_brt.replace(hour=_spec, minute=0, second=0, microsecond=0)
         else:
-            next_brt = last_brt + timedelta(hours=interval_hours)
+            next_brt = base_brt + timedelta(hours=_interval)
             if not (HOUR_MIN <= next_brt.hour < HOUR_MAX):
                 next_brt = (next_brt + timedelta(days=1)).replace(
                     hour=HOUR_MIN, minute=0, second=0, microsecond=0
                 )
+
+        # Garantia extra: next_dose nunca fica no passado
         next_utc = next_brt + timedelta(hours=3)
+        while next_utc <= now_utc:
+            if _spec is not None:
+                next_utc += timedelta(days=1)
+            else:
+                next_utc += timedelta(hours=max(_interval, 1))
+
         conn.execute("UPDATE prescriptions SET next_dose_at=? WHERE id=?",
                      (next_utc.isoformat(), prescription_id))
         conn.commit()
