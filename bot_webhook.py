@@ -531,9 +531,14 @@ def messages_upsert():
                 send_whatsapp(phone, list_templates())
                 return jsonify({"status": "templates_listed"}), 200
 
-            # /cancelar_prescrição: ID ou telefone
+            # /cancelar_prescricao: ou /cancelar_prescrição: (ambas grafias aceitas)
+            _cancel_rx = None
             if text_lower.startswith("/cancelar_prescrição:"):
-                arg = text[len("/cancelar_prescrição:"):].strip()
+                _cancel_rx = text[len("/cancelar_prescrição:"):].strip()
+            elif text_lower.startswith("/cancelar_prescricao:"):
+                _cancel_rx = text[len("/cancelar_prescricao:"):].strip()
+            if _cancel_rx is not None:
+                arg = _cancel_rx
                 if arg.isdigit():
                     ok = cancel_prescription(int(arg))
                     reply = f"✅ Prescrição #{arg} cancelada." if ok else f"❌ Prescrição #{arg} não encontrada."
