@@ -620,9 +620,16 @@ def messages_upsert():
                 _cancel_rx = text[len("/cancelar_prescricao:"):].strip()
             if _cancel_rx is not None:
                 arg = _cancel_rx
-                if arg.isdigit():
+                # Número com >= 10 dígitos é sempre TELEFONE, não ID de prescrição
+                # IDs são pequenos inteiros sequenciais (1, 2, 3...)
+                if arg.isdigit() and len(arg) < 10:
                     ok = cancel_prescription(int(arg))
                     reply = f"✅ Prescrição #{arg} cancelada." if ok else f"❌ Prescrição #{arg} não encontrada."
+                elif arg.isdigit() and len(arg) >= 10:
+                    # Telefone — cancela todas as prescrições ativas do paciente
+                    count = cancel_patient_prescriptions(arg)
+                    reply = (f"✅ {count} prescrição(ões) cancelada(s) para *...{arg[-4:]}*."
+                             if count else f"❌ Nenhuma prescrição ativa para *...{arg[-4:]}*.")
                 elif len(arg) >= 10:
                     count = cancel_patient_prescriptions(arg)
                     reply = (f"✅ {count} prescrição(ões) cancelada(s) para *...{arg[-4:]}*."
