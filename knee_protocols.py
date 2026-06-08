@@ -196,7 +196,36 @@ def remove_patient_protocol(n, protocol_title):
 
 
 def list_admin_help():
-    return list_protocols_numbered()
+    protos = list_protocols_numbered()
+    cmds = """*COMANDOS ADMIN — URIEL BOT*
+
+*PROTOCOLOS CLINICOS*
+/instrucao Titulo: conteudo  — salvar protocolo
+/ver N                        — ver protocolo #N
+/editar N                     — editar protocolo #N
+/apagar N                     — apagar protocolo #N
+/consultar N: pergunta        — consultar protocolo com IA
+/N: 55249XXXXXXX              — vincular protocolo #N ao paciente
+/ver_pacientes                — listar pacientes vinculados
+/ver_paciente N               — detalhe do paciente #N
+/remover_protocolo N: Titulo  — desvincular protocolo do paciente
+
+*PRESCRICOES*
+/receita: 55249XXX med posol  — prescrever (inline)
+/receita: med posologia dur   — salvar template (sem tel)
+/receita: 55249XXX 1 2 3      — aplicar templates ao paciente
+/receita: 55249XXX 1 por Xd   — aplicar template com duracao
+/templates                    — listar templates salvos
+/apagar receita N             — apagar template #N
+/receitas                     — listar prescricoes ativas
+/cancelar_prescricao: ID|tel  — cancelar prescricao
+
+*OUTROS*
+/estudo                       — modo estudo clinico (RAG)
+/ver_comandos                 — este painel
+
+"""
+    return cmds + protos
 
 
 def get_protocol_by_number(n):
