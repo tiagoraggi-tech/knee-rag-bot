@@ -43,6 +43,9 @@ AUDIT_LOG = os.getenv("AUDIT_LOG", "/data/rag_audit.jsonl")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 # Token dedicado para os endpoints de manutencao (/admin/ingest e /debug).
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+# Token da ponte RAG: permite que o bot principal (uriel-lorena-bot) consulte
+# a base cientifica deste servico via /rag/ask e /rag/retrieve.
+RAG_BRIDGE_TOKEN = os.getenv("RAG_BRIDGE_TOKEN", "")
 
 for _name in ("GROQ_API_KEY", "EVOLUTION_API_URL", "EVOLUTION_API_KEY"):
     if not os.getenv(_name):
@@ -782,6 +785,59 @@ def debug():
     return jsonify({"chroma_dir": CHROMA_DIR, "chroma_exists": os.path.exists(CHROMA_DIR),
         "audit_log": AUDIT_LOG,
         "evolution_url": EVOLUTION_URL, "instance": EVOLUTION_INSTANCE})
+
+# ── PONTE RAG: API para o bot principal (uriel-lorena-bot) ──────────────────
+def _verify_rag_token(req) -> bool:
+    """Fail-closed: sem RAG_BRIDGE_TOKEN configurado, a ponte fica desligada."""
+    if not RAG_BRIDGE_TOKEN:
+        return False
+    provided = req.headers.get("X-RAG-Token", "")
+    return bool(provided) and hmac.compare_digest(provided, RAG_BRIDGE_TOKEN)
+
+
+@app.route("/rag/ask", methods=["POST"])
+def rag_ask():
+    """Resposta educativa completa (guardrails CFM) para uma pergunta de paciente."""
+    if not _verify_rag_token(request):
+        return jsonify({"status": "unauthorized"}), 403
+    body = request.get_json(force=True) or {}
+    question = (body.get("question") or "").strip()
+    if not question:
+        return jsonify({"status": "bad_request", "detail": "question obrigatoria"}), 400
+    try:
+        result = chain.ask(
+            question,
+            patient_id_hash=body.get("patient_hash"),
+            protocol_context=body.get("protocol_context") or None,
+        )
+        return jsonify({
+            "status": "ok",
+            "answer": format_for_whatsapp(result),
+            "red_flag": result["red_flag"],
+            "retrieved_count": result["retrieved_count"],
+        }), 200
+    except Exception as e:
+        log.exception("rag_ask: %s", e)
+        return jsonify({"status": "error"}), 500
+
+
+@app.route("/rag/retrieve", methods=["POST"])
+def rag_retrieve():
+    """So o contexto recuperado (literatura + fontes), para o chamador montar a resposta."""
+    if not _verify_rag_token(request):
+        return jsonify({"status": "unauthorized"}), 403
+    body = request.get_json(force=True) or {}
+    question = (body.get("question") or "").strip()
+    if not question:
+        return jsonify({"status": "bad_request", "detail": "question obrigatoria"}), 400
+    try:
+        results = chain.retrieve(question)
+        context, sources = chain._format_context(results) if results else ("", [])
+        return jsonify({"status": "ok", "context": context, "sources": sources}), 200
+    except Exception as e:
+        log.exception("rag_retrieve: %s", e)
+        return jsonify({"status": "error"}), 500
+
 
 @app.route("/admin/ingest", methods=["POST"])
 def admin_ingest():
