@@ -228,7 +228,12 @@ class KneeRAGChain:
                 "red_flag": True, "retrieved_count": 0,
             }
 
-        results = self.retrieve(question, scope_filter=scope_filter)
+        # Se há protocolo clínico vinculado, não consulta RAG de joelho —
+        # o protocolo do Dr. Tiago tem prioridade total sobre a literatura genérica.
+        if protocol_context:
+            results = []
+        else:
+            results = self.retrieve(question, scope_filter=scope_filter)
 
         # Se há protocolo vinculado, usa mesmo sem resultados do RAG
         if not results and not protocol_context:
@@ -252,8 +257,20 @@ class KneeRAGChain:
         else:
             full_context = context
 
+        # Quando há protocolo, informa o LLM que não deve limitar ao joelho
+        if protocol_context:
+            system_content = SYSTEM_PROMPT + (
+                "\n\n## ATENÇÃO — PACIENTE COM PROTOCOLO ESPECÍFICO\n"
+                "Este paciente possui um PROTOCOLO CLÍNICO específico cadastrado pelo Dr. Tiago (seção ## PROTOCOLOS CLÍNICOS acima). "
+                "Responda EXCLUSIVAMENTE com base neste protocolo. "
+                "Não limite sua resposta a condições do joelho — o protocolo pode ser para qualquer região ou condição tratada pelo Dr. Tiago. "
+                "NÃO mencione joelho, neuroproloterapia do joelho ou condições não relacionadas ao protocolo do paciente."
+            )
+        else:
+            system_content = SYSTEM_PROMPT
+
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=system_content),
             HumanMessage(content=USER_TEMPLATE.format(context=full_context, question=question)),
         ]
 
