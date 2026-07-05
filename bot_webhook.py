@@ -10,7 +10,7 @@ acontece no uriel-lorena-bot, que consulta este servico via:
 Autenticacao: header X-RAG-Token == RAG_BRIDGE_TOKEN (fail-closed).
 Manutencao: /admin/ingest e /debug exigem X-Admin-Token == ADMIN_TOKEN.
 """
-import os, hmac, logging, threading
+import os, time, hmac, logging, threading
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from knee_retrieval_chain import KneeRAGChain, format_for_whatsapp
@@ -27,6 +27,10 @@ AUDIT_LOG = os.getenv("AUDIT_LOG", "/data/rag_audit.jsonl")
 RAG_BRIDGE_TOKEN = os.getenv("RAG_BRIDGE_TOKEN", "")
 # Token dos endpoints de manutencao (/admin/ingest e /debug). Fail-closed.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+# Auto-ingestao (opcao A): base se atualiza sozinha, sem comando manual.
+AUTO_INGEST = os.getenv("AUTO_INGEST", "1") == "1"       # "0" desliga
+INGEST_INTERVAL_DAYS = int(os.getenv("INGEST_INTERVAL_DAYS", "7"))
+INGEST_PUBMED_MAX = int(os.getenv("INGEST_PUBMED_MAX", "30"))
 
 if not GROQ_API_KEY:
     log.warning("Config ausente: GROQ_API_KEY")
@@ -111,26 +115,82 @@ def debug():
     }), 200
 
 
+_ingest_lock = threading.Lock()
+_ingest_status = {"running": False, "last_ok": None, "last_error": None}
+
+
+def _run_ingest():
+    """Baixa PubMed + sites e reconstroi a base. Serializado por _ingest_lock."""
+    if not _ingest_lock.acquire(blocking=False):
+        log.info("Ingestao ja em andamento — ignorando novo pedido.")
+        return
+    try:
+        _ingest_status["running"] = True
+        from knee_loader import KneeKnowledgeLoader
+        log.info("=== INGESTAO INICIADA ===")
+        loader = KneeKnowledgeLoader(
+            persist_dir=CHROMA_DIR,
+            entrez_email=os.getenv("ENTREZ_EMAIL", "tiagoraggi@gmail.com"),
+        )
+        loader.ingest_pubmed(max_results=INGEST_PUBMED_MAX)
+        loader.ingest_websites()
+        loader.build_vectorstore()
+        _ingest_status["last_ok"] = time.time()
+        log.info("=== INGESTAO CONCLUIDA ===")
+    except Exception as e:
+        _ingest_status["last_error"] = str(e)
+        log.exception("Erro na ingestao: %s", e)
+    finally:
+        _ingest_status["running"] = False
+        _ingest_lock.release()
+
+
+def _base_docs_count():
+    try:
+        return chain.vectorstore._collection.count()
+    except Exception:
+        return -1
+
+
+def _auto_ingest_worker():
+    """Opcao A: no boot popula a base se estiver vazia; depois reindexao semanal."""
+    time.sleep(20)  # deixa o servico subir antes de puxar carga
+    if _base_docs_count() == 0:
+        log.info("Base vazia no boot — rodando ingestao inicial.")
+        _run_ingest()
+    intervalo = max(1, INGEST_INTERVAL_DAYS) * 86400
+    while True:
+        time.sleep(intervalo)
+        log.info("Reindexacao periodica (a cada %d dia(s)).", INGEST_INTERVAL_DAYS)
+        _run_ingest()
+
+
 @app.route("/admin/ingest", methods=["POST"])
 def admin_ingest():
+    """Dispara ingestao manual (alem da automatica)."""
     if not _verify_token(request, "X-Admin-Token", ADMIN_TOKEN):
         return jsonify({"status": "unauthorized"}), 403
-    from knee_loader import KneeKnowledgeLoader
-    def run_ingest():
-        try:
-            log.info("=== INGESTAO INICIADA ===")
-            loader = KneeKnowledgeLoader(
-                persist_dir=CHROMA_DIR,
-                entrez_email=os.getenv("ENTREZ_EMAIL", "tiagoraggi@gmail.com"),
-            )
-            loader.ingest_pubmed(max_results=30)
-            loader.ingest_websites()
-            loader.build_vectorstore()
-            log.info("=== INGESTAO CONCLUIDA ===")
-        except Exception as e:
-            log.exception("Erro na ingestao: %s", e)
-    threading.Thread(target=run_ingest, daemon=True).start()
+    threading.Thread(target=_run_ingest, daemon=True).start()
     return jsonify({"status": "ingest_started", "message": "Verifique os logs do Railway"}), 202
+
+
+@app.route("/admin/ingest/status", methods=["GET"])
+def admin_ingest_status():
+    if not _verify_token(request, "X-Admin-Token", ADMIN_TOKEN):
+        return jsonify({"status": "unauthorized"}), 403
+    return jsonify({
+        "running": _ingest_status["running"],
+        "docs_na_base": _base_docs_count(),
+        "last_ok": _ingest_status["last_ok"],
+        "last_error": _ingest_status["last_error"],
+        "auto_ingest": AUTO_INGEST,
+        "intervalo_dias": INGEST_INTERVAL_DAYS,
+    }), 200
+
+
+if AUTO_INGEST:
+    threading.Thread(target=_auto_ingest_worker, daemon=True, name="auto-ingest").start()
+    log.info("Auto-ingestao ligada (intervalo=%d dia(s)).", INGEST_INTERVAL_DAYS)
 
 
 if __name__ == "__main__":
