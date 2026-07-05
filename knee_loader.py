@@ -69,6 +69,14 @@ KNEE_QUERIES_PUBMED = {
     "artroplastia_total": '("total knee arthroplasty"[Title/Abstract] OR "total knee replacement"[Title/Abstract]) AND ("2020"[PDAT]:"2026"[PDAT])',
     "artroplastia_unicompartimental": '("unicompartmental knee arthroplasty"[Title/Abstract]) AND ("2020"[PDAT]:"2026"[PDAT])',
     "osteotomia": '("high tibial osteotomy"[Title/Abstract] OR "knee osteotomy"[Title/Abstract]) AND ("2020"[PDAT]:"2026"[PDAT])',
+
+    # Proloterapia / neuroproloterapia (procedimentos do Dr. Tiago) — janela
+    # temporal maior: os ensaios de referencia sao de 2005 em diante
+    "proloterapia_joelho": '("prolotherapy"[Title/Abstract] OR "dextrose injection"[Title/Abstract]) AND ("knee"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
+    "proloterapia_sacroiliaca_lombar": '("prolotherapy"[Title/Abstract]) AND ("sacroiliac"[Title/Abstract] OR "low back pain"[Title/Abstract] OR "lumbar"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
+    "proloterapia_dextrose_geral": '("dextrose prolotherapy"[Title/Abstract]) AND ("mechanism"[Title/Abstract] OR "adverse"[Title/Abstract] OR "systematic review"[Title/Abstract] OR "randomized"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
+    "neuroproloterapia": '("perineural injection"[Title/Abstract] OR "neural prolotherapy"[Title/Abstract] OR "subcutaneous prolotherapy"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
+    "viscossuplementacao": '("viscosupplementation"[Title/Abstract]) AND ("knee"[Title/Abstract]) AND ("2015"[PDAT]:"2026"[PDAT])',
 }
 
 KNEE_QUERIES_SCHOLAR = [
@@ -84,6 +92,11 @@ SOCIETY_URLS = {
     "AAOS_OrthoInfo_Knee": "https://orthoinfo.aaos.org/en/diseases--conditions/?topic=Knee",
     "SBOT_Joelho": "https://sbot.org.br/",
     "SBCJ": "https://www.sbcj.org.br/",
+    # Proloterapia — fontes usadas no protocolo pos-procedimento (04/07/2026)
+    "Rabago_Prolotherapy_PrimaryCare": "https://pmc.ncbi.nlm.nih.gov/articles/PMC2831229/",
+    "MDPI_Prolotherapy_LowBack_Review": "https://www.mdpi.com/1648-9144/61/9/1588",
+    "FasciaInstitute_PostInjection": "https://fasciainstitute.org/prolotherapy-post-injection-instructions/",
+    "AAPMR_Dextrose_Injection": "https://now.aapmr.org/therapeutic-injection-of-dextrose-prolotherapy-perineural-injection-therapy-and-hydrodissection/",
 }
 
 
