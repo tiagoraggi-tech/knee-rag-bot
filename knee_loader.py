@@ -77,6 +77,19 @@ KNEE_QUERIES_PUBMED = {
     "proloterapia_dextrose_geral": '("dextrose prolotherapy"[Title/Abstract]) AND ("mechanism"[Title/Abstract] OR "adverse"[Title/Abstract] OR "systematic review"[Title/Abstract] OR "randomized"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
     "neuroproloterapia": '("perineural injection"[Title/Abstract] OR "neural prolotherapy"[Title/Abstract] OR "subcutaneous prolotherapy"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
     "viscossuplementacao": '("viscosupplementation"[Title/Abstract]) AND ("knee"[Title/Abstract]) AND ("2015"[PDAT]:"2026"[PDAT])',
+
+    # ── ESCOPO AMPLIADO — dor musculoesqueletica e terapias regenerativas ──
+    # (pratica do Dr. Tiago vai alem do joelho; o PubMed ao vivo ja cobre
+    #  qualquer tema, mas estas queries enriquecem a base curada/reranqueada)
+    "ombro": '("rotator cuff"[Title/Abstract] OR "shoulder pain"[Title/Abstract] OR "adhesive capsulitis"[Title/Abstract] OR "shoulder tendinopathy"[Title/Abstract]) AND ("conservative"[Title/Abstract] OR "injection"[Title/Abstract] OR "rehabilitation"[Title/Abstract]) AND ("2018"[PDAT]:"2026"[PDAT])',
+    "quadril": '("hip osteoarthritis"[Title/Abstract] OR "greater trochanteric pain"[Title/Abstract] OR "gluteal tendinopathy"[Title/Abstract]) AND ("2018"[PDAT]:"2026"[PDAT])',
+    "coluna_lombar": '("chronic low back pain"[Title/Abstract] OR "lumbar degenerative disc"[Title/Abstract] OR "facet joint"[Title/Abstract]) AND ("conservative"[Title/Abstract] OR "injection"[Title/Abstract] OR "prolotherapy"[Title/Abstract]) AND ("2015"[PDAT]:"2026"[PDAT])',
+    "coluna_cervical": '("chronic neck pain"[Title/Abstract] OR "cervical radiculopathy"[Title/Abstract]) AND ("conservative"[Title/Abstract] OR "injection"[Title/Abstract] OR "physical therapy"[Title/Abstract]) AND ("2018"[PDAT]:"2026"[PDAT])',
+    "cotovelo": '("lateral epicondylitis"[Title/Abstract] OR "tennis elbow"[Title/Abstract] OR "medial epicondylitis"[Title/Abstract]) AND ("2015"[PDAT]:"2026"[PDAT])',
+    "pe_tornozelo": '("plantar fasciitis"[Title/Abstract] OR "achilles tendinopathy"[Title/Abstract] OR "chronic ankle instability"[Title/Abstract]) AND ("injection"[Title/Abstract] OR "prolotherapy"[Title/Abstract] OR "conservative"[Title/Abstract]) AND ("2015"[PDAT]:"2026"[PDAT])',
+    "proloterapia_regioes": '("prolotherapy"[Title/Abstract] OR "perineural injection"[Title/Abstract]) AND ("shoulder"[Title/Abstract] OR "elbow"[Title/Abstract] OR "hip"[Title/Abstract] OR "ankle"[Title/Abstract] OR "tendinopathy"[Title/Abstract]) AND ("2005"[PDAT]:"2026"[PDAT])',
+    "regenerativa_prp": '("platelet-rich plasma"[Title/Abstract]) AND ("musculoskeletal"[Title/Abstract] OR "tendinopathy"[Title/Abstract] OR "osteoarthritis"[Title/Abstract]) AND ("2019"[PDAT]:"2026"[PDAT])',
+    "dor_miofascial": '("myofascial pain"[Title/Abstract] OR "trigger point"[Title/Abstract]) AND ("injection"[Title/Abstract] OR "dry needling"[Title/Abstract]) AND ("2015"[PDAT]:"2026"[PDAT])',
 }
 
 KNEE_QUERIES_SCHOLAR = [
