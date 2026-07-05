@@ -214,7 +214,10 @@ class KneeRAGChain:
         scope_filter: Optional[str] = None,
         patient_id_hash: Optional[str] = None,
         protocol_context: Optional[str] = None,
+        safety_context: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # safety_context: politica clinica + perfil de seguranca do paciente.
+        # Injetado no system SEM desligar o RAG (diferente de protocol_context).
         timestamp = datetime.utcnow().isoformat()
 
         if has_red_flags(question):
@@ -268,6 +271,10 @@ class KneeRAGChain:
             )
         else:
             system_content = SYSTEM_PROMPT
+
+        # Politica clinica / perfil de seguranca do paciente — reforca sem desligar o RAG
+        if safety_context:
+            system_content = system_content + "\n\n" + safety_context
 
         messages = [
             SystemMessage(content=system_content),

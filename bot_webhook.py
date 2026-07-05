@@ -69,6 +69,7 @@ def rag_ask():
             question,
             patient_id_hash=body.get("patient_hash"),
             protocol_context=body.get("protocol_context") or None,
+            safety_context=body.get("safety_context") or None,
         )
         return jsonify({
             "status": "ok",
